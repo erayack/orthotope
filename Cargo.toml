@@ -1,0 +1,59 @@
+[package]
+name = "orthotope"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+memmap2 = "0.9.5"
+parking_lot = "0.12.3"
+thiserror = "2.0.12"
+
+[lints.rust]
+warnings = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = 10 }
+perf = { level = "deny", priority = 9 }
+pedantic = { level = "warn", priority = 3 }
+nursery = { level = "warn", priority = 2 }
+needless_collect = { level = "deny", priority = 11 }
+redundant_clone = { level = "deny", priority = 11 }
+unnecessary_wraps = { level = "deny", priority = 11 }
+unwrap_used = { level = "deny", priority = 8 }
+expect_used = { level = "deny", priority = 8 }
+dbg_macro = { level = "deny", priority = 8 }
+todo = { level = "warn", priority = 8 }
+unimplemented = { level = "deny", priority = 8 }
+print_stdout = { level = "deny", priority = 8 }
+print_stderr = { level = "deny", priority = 8 }
+mem_forget = { level = "deny", priority = 8 }
+undocumented_unsafe_blocks = { level = "deny", priority = 8 }
+
+[profile.dev]
+opt-level = 1
+debug = 2
+debug-assertions = true
+overflow-checks = true
+incremental = true
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+debug = 1
+incremental = false
+overflow-checks = true
+
+[profile.test]
+opt-level = 1
+debug = 2
