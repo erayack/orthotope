@@ -75,16 +75,12 @@ Small-request classes:
 
 ## Benchmarking
 
-Criterion benchmarks live under `benches/` and compare Orthotope against other
-allocation backends without changing Orthotope's production API shape.
+Benchmark results are summarized in [`benchmark.md`](benchmark.md).
 
-- In the current local benchmark run, Orthotope was fastest on same-thread hot-path
-  small allocations and batch churn.
-- The current large-allocation benchmark favored the comparison allocators.
+In the current local run, Orthotope was:
 
-- `just bench-core` runs Orthotope and the system allocator
-- `just bench` also enables optional `mimalloc` and `jemalloc` comparisons
+- about `1.5x` to `13x` faster on same-thread hot-path reuse workloads
+- about `1.1x` to `3x` faster on `embedding_batch`
+- about `3x` to `4.5x` faster on `mixed_size_churn` against `jemalloc` and `mimalloc`
 
-See [`docs/benchmarking.md`](docs/benchmarking.md) for workload details, feature
-flags, caveats around interpreting machine-local benchmark numbers, and the latest
-captured results in [`benchmark.md`](benchmark.md).
+The current `large_path` benchmark favored the comparison allocators.
