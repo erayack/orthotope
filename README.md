@@ -1,6 +1,18 @@
 # Orthotope
 
+[![Crates.io](https://img.shields.io/crates/v/orthotope.svg)](https://crates.io/crates/orthotope)
+[![Documentation](https://docs.rs/orthotope/badge.svg)](https://docs.rs/orthotope)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Orthotope is a Rust allocator library with:
+
+## Installation
+
+```sh
+cargo add orthotope
+```
+
+## Features
 
 - a pre-mapped arena
 - fixed size classes up to `16 MiB`
