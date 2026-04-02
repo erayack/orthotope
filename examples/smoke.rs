@@ -1,8 +1,7 @@
 use std::error::Error;
 use std::io::{Write, stdout};
 
-use orthotope::size_class::SizeClass;
-use orthotope::{allocate, deallocate};
+use orthotope::{SizeClass, allocate, deallocate};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut out = stdout().lock();

@@ -13,12 +13,11 @@ pub mod large_object;
 pub mod size_class;
 pub mod thread_cache;
 
-use crate::allocator::Allocator;
-use crate::error::InitError;
-use crate::thread_cache::{ThreadCache, ThreadCacheHandle};
+use crate::thread_cache::ThreadCacheHandle;
+use crate::{allocator::Allocator as AllocatorType, error::InitError as InitErrorType};
 
-static GLOBAL_ALLOCATOR: LazyLock<Result<Allocator, InitError>> =
-    LazyLock::new(|| Allocator::new(config::AllocatorConfig::default()));
+static GLOBAL_ALLOCATOR: LazyLock<Result<AllocatorType, InitErrorType>> =
+    LazyLock::new(|| AllocatorType::new(AllocatorConfig::default()));
 
 thread_local! {
     static THREAD_CACHE: RefCell<Option<ThreadCacheHandle>> = const { RefCell::new(None) };
@@ -40,4 +39,9 @@ pub(crate) fn with_thread_cache<R>(
     })
 }
 
+pub use crate::allocator::Allocator;
 pub use crate::api::{allocate, deallocate, deallocate_with_size};
+pub use crate::config::AllocatorConfig;
+pub use crate::error::{AllocError, FreeError, InitError};
+pub use crate::size_class::SizeClass;
+pub use crate::thread_cache::ThreadCache;

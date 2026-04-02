@@ -7,8 +7,8 @@ use crate::error::{AllocError, FreeError, InitError};
 #[cfg(test)]
 use crate::free_list::Batch;
 use crate::header::{
-    AllocationHeader, AllocationKind, HEADER_SIZE, block_start_from_user_ptr, header_from_user_ptr,
-    user_ptr_from_block_start,
+    AllocationHeader, AllocationKind, HEADER_ALIGNMENT, HEADER_SIZE, block_start_from_user_ptr,
+    header_from_user_ptr, user_ptr_from_block_start,
 };
 use crate::large_object::LargeObjectAllocator;
 use crate::size_class::SizeClass;
@@ -39,6 +39,7 @@ impl Allocator {
     /// Propagates arena initialization failures for invalid configuration or mapping
     /// errors.
     pub fn new(config: AllocatorConfig) -> Result<Self, InitError> {
+        validate_allocator_config(&config)?;
         let arena = Arena::new(&config)?;
 
         Ok(Self {
@@ -250,7 +251,7 @@ impl Allocator {
 
         let user_ptr = user_ptr_from_block_start(block_start);
         self.large
-            .record_live_allocation(user_ptr, block_start, block_size, requested_size);
+            .record_live_allocation(user_ptr, requested_size, usable_size);
 
         Ok(user_ptr)
     }
@@ -300,7 +301,11 @@ impl Allocator {
                 Ok(())
             }
             AllocationKind::Large => {
-                self.large.release_live_allocation(user_ptr)?;
+                self.large.validate_and_release_live_allocation(
+                    user_ptr,
+                    header.requested_size(),
+                    header.usable_size(),
+                )?;
                 Ok(())
             }
         }
@@ -325,4 +330,14 @@ const fn align_up_checked(value: usize, alignment: usize) -> Option<usize> {
     } else {
         value.checked_add(alignment - remainder)
     }
+}
+
+const fn validate_allocator_config(config: &AllocatorConfig) -> Result<(), InitError> {
+    if config.alignment < HEADER_ALIGNMENT {
+        return Err(InitError::InvalidConfig(
+            "allocator alignment must be at least 64 bytes",
+        ));
+    }
+
+    Ok(())
 }
