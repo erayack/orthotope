@@ -168,3 +168,25 @@ fn crate_root_reexports_support_public_api_usage() {
     let result = unsafe { deallocate(ptr) };
     assert_eq!(result, Ok(()));
 }
+
+#[test]
+fn misaligned_user_pointer_is_rejected_before_header_read() {
+    let (allocator, mut cache) = allocator_and_cache();
+    let ptr = match allocator.allocate_with_cache(&mut cache, 32) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected small allocation to succeed: {error}"),
+    };
+
+    let shifted = NonNull::new(ptr.as_ptr().wrapping_add(1))
+        .unwrap_or_else(|| panic!("shifted live pointer should remain non-null"));
+
+    // SAFETY: this intentionally violates the allocator contract to verify the decode
+    // path rejects a misaligned user pointer before normal header decoding.
+    let result = unsafe { allocator.deallocate_with_cache(&mut cache, shifted) };
+    assert_eq!(result, Err(FreeError::CorruptHeader));
+
+    // SAFETY: the original pointer is still live because the rejected shifted pointer
+    // must not consume or reroute the real allocation.
+    let cleanup = unsafe { allocator.deallocate_with_cache(&mut cache, ptr) };
+    assert_eq!(cleanup, Ok(()));
+}

@@ -314,9 +314,18 @@ impl Allocator {
     unsafe fn decode_header(
         user_ptr: NonNull<u8>,
     ) -> Result<(AllocationHeader, AllocationKind), FreeError> {
+        let user_addr = user_ptr.as_ptr().addr();
+        let Some(header_addr) = user_addr.checked_sub(HEADER_SIZE) else {
+            return Err(FreeError::CorruptHeader);
+        };
+        if !header_addr.is_multiple_of(HEADER_ALIGNMENT) {
+            return Err(FreeError::CorruptHeader);
+        }
+
         let header_ptr = header_from_user_ptr(user_ptr);
-        // SAFETY: `header_ptr` points to the allocation header immediately preceding
-        // `user_ptr`; reading a copy lets validation inspect the stored metadata.
+        // SAFETY: the checked subtraction and alignment guard above ensure the derived
+        // header address is plausibly aligned for `AllocationHeader`; reading a copy
+        // lets validation inspect the stored metadata before any routing decision.
         let header = unsafe { header_ptr.as_ptr().read() };
         let kind = header.validate()?;
         Ok((header, kind))
