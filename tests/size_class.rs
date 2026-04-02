@@ -64,6 +64,23 @@ fn config_aware_block_sizes_expand_with_custom_alignment() {
 }
 
 #[test]
+fn config_helpers_clamp_low_alignment_instead_of_panicking() {
+    let config = AllocatorConfig {
+        arena_size: 64,
+        alignment: 0,
+        refill_target_bytes: 128,
+        local_cache_target_bytes: 256,
+    };
+
+    assert_eq!(
+        config.class_block_size(SizeClass::B64),
+        SizeClass::B64.block_size()
+    );
+    assert_eq!(config.refill_count(SizeClass::B64), 1);
+    assert_eq!(config.local_limit(SizeClass::B64), 2);
+}
+
+#[test]
 fn config_defaults_match_allocator_plan() {
     let config = AllocatorConfig::default();
 

@@ -71,8 +71,14 @@ impl SizeClass {
 
     #[must_use]
     /// Returns the full allocator block size for this class using `alignment`.
+    ///
+    /// Alignments below the crate's minimum block alignment are clamped up to `64`
+    /// so this helper remains total even before allocator validation.
     pub const fn block_size_for_alignment(self, alignment: usize) -> usize {
-        align_up(self.payload_size() + HEADER_SIZE, alignment)
+        align_up(
+            self.payload_size() + HEADER_SIZE,
+            effective_block_alignment(alignment),
+        )
     }
 
     #[must_use]
@@ -101,5 +107,13 @@ const fn align_up(value: usize, alignment: usize) -> usize {
         value
     } else {
         value + (alignment - remainder)
+    }
+}
+
+const fn effective_block_alignment(alignment: usize) -> usize {
+    if alignment < BLOCK_ALIGNMENT {
+        BLOCK_ALIGNMENT
+    } else {
+        alignment
     }
 }
