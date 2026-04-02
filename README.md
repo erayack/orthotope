@@ -6,14 +6,6 @@
 
 Orthotope is a Rust allocator library with:
 
-## Installation
-
-```sh
-cargo add orthotope
-```
-
-## Features
-
 - a pre-mapped arena
 - fixed size classes up to `16 MiB`
 - per-thread caches
@@ -22,6 +14,12 @@ cargo add orthotope
 
 It is aimed at allocation-heavy workloads such as ML inference, tensor pipelines,
 batched embedding or reranking services, and other high-throughput systems.
+
+## Installation
+
+```sh
+cargo add orthotope
+```
 
 ## API
 
