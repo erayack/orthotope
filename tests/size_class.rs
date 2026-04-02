@@ -47,6 +47,23 @@ fn block_sizes_cover_header_and_payload_and_stay_aligned() {
 }
 
 #[test]
+fn config_aware_block_sizes_expand_with_custom_alignment() {
+    let config = AllocatorConfig {
+        arena_size: 1 << 20,
+        alignment: 128,
+        refill_target_bytes: 1 << 10,
+        local_cache_target_bytes: 1 << 10,
+    };
+
+    assert_eq!(config.class_block_size(SizeClass::B256), 384);
+    assert_eq!(
+        config.class_block_size(SizeClass::B256),
+        SizeClass::B256.block_size_for_alignment(config.alignment)
+    );
+    assert!(config.class_block_size(SizeClass::B256) > SizeClass::B256.block_size());
+}
+
+#[test]
 fn config_defaults_match_allocator_plan() {
     let config = AllocatorConfig::default();
 

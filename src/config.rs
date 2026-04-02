@@ -15,16 +15,22 @@ pub struct AllocatorConfig {
 
 impl AllocatorConfig {
     #[must_use]
+    /// Returns the full allocator block size for `class` under this configuration.
+    pub const fn class_block_size(&self, class: SizeClass) -> usize {
+        class.block_size_for_alignment(self.alignment)
+    }
+
+    #[must_use]
     /// Returns the refill batch size, in blocks, for `class`.
     pub const fn refill_count(&self, class: SizeClass) -> usize {
-        let count = self.refill_target_bytes / class.block_size_for_alignment(self.alignment);
+        let count = self.refill_target_bytes / self.class_block_size(class);
         if count == 0 { 1 } else { count }
     }
 
     #[must_use]
     /// Returns the local per-class block limit before a drain is triggered.
     pub const fn local_limit(&self, class: SizeClass) -> usize {
-        let limit = self.local_cache_target_bytes / class.block_size_for_alignment(self.alignment);
+        let limit = self.local_cache_target_bytes / self.class_block_size(class);
         if limit < 2 { 2 } else { limit }
     }
 

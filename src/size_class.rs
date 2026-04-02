@@ -61,7 +61,10 @@ impl SizeClass {
     }
 
     #[must_use]
-    /// Returns the full allocator block size for this class, including header space.
+    /// Returns the full allocator block size for this class under the default 64-byte alignment.
+    ///
+    /// For allocator-specific capacity planning under a custom alignment, prefer
+    /// [`Self::block_size_for_alignment`] or [`crate::AllocatorConfig::class_block_size`].
     pub const fn block_size(self) -> usize {
         align_up(self.payload_size() + HEADER_SIZE, BLOCK_ALIGNMENT)
     }
