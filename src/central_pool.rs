@@ -3,12 +3,14 @@ use parking_lot::Mutex;
 use crate::free_list::{Batch, FreeList};
 use crate::size_class::{NUM_CLASSES, SizeClass};
 
+/// Shared per-class batch exchange between thread-local caches.
 pub(crate) struct CentralPool {
     lists: [Mutex<FreeList>; NUM_CLASSES],
 }
 
 impl CentralPool {
     #[must_use]
+    /// Creates an empty central pool.
     pub(crate) fn new() -> Self {
         Self {
             lists: core::array::from_fn(|_| Mutex::new(FreeList::new())),
@@ -16,6 +18,7 @@ impl CentralPool {
     }
 
     #[must_use]
+    /// Removes up to `max` detached blocks from the shared list for `class`.
     pub(crate) fn take_batch(&self, class: SizeClass, max: usize) -> Batch {
         let mut list = self.lists[class.index()].lock();
         // SAFETY: each class list is protected by its mutex, so this detached batch

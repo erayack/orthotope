@@ -5,24 +5,29 @@ use std::collections::hash_map::Entry;
 use parking_lot::Mutex;
 
 use crate::error::FreeError;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Live-registry entry for one large allocation.
 pub(crate) struct LargeAllocationRecord {
     pub(crate) requested_size: usize,
     pub(crate) usable_size: usize,
 }
 
+/// Tracks live allocations larger than the largest small class.
 pub(crate) struct LargeObjectAllocator {
     live: Mutex<HashMap<usize, LargeAllocationRecord>>,
 }
 
 impl LargeObjectAllocator {
     #[must_use]
+    /// Creates an empty large-allocation registry.
     pub(crate) fn new() -> Self {
         Self {
             live: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Records one newly allocated large block as live.
     pub(crate) fn record_live_allocation(
         &self,
         user_ptr: NonNull<u8>,

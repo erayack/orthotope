@@ -6,6 +6,9 @@ use memmap2::MmapMut;
 use crate::config::AllocatorConfig;
 use crate::error::{AllocError, InitError};
 
+/// Monotonic arena backed by one anonymous memory mapping.
+///
+/// Reservations are thread-safe and are never returned to the arena in v1.
 pub struct Arena {
     _mapping: MmapMut,
     base: NonNull<u8>,
@@ -116,11 +119,13 @@ impl Arena {
     }
 
     #[must_use]
+    /// Returns the remaining unreserved capacity in bytes.
     pub fn remaining(&self) -> usize {
         self.len.saturating_sub(self.next.load(Ordering::Relaxed))
     }
 
     #[must_use]
+    /// Returns the configured block-start alignment.
     pub const fn alignment(&self) -> usize {
         self.alignment
     }

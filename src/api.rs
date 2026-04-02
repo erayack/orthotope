@@ -3,6 +3,11 @@ use core::ptr::NonNull;
 use crate::error::{AllocError, FreeError};
 use crate::with_thread_cache;
 
+/// Allocates `size` bytes from the process-global allocator.
+///
+/// The returned pointer is non-null and points to the user-visible payload region of
+/// an internal allocator block.
+///
 /// # Errors
 ///
 /// Returns [`AllocError::GlobalInitFailed`] when the process-global allocator could not
@@ -32,7 +37,8 @@ pub fn allocate(size: usize) -> Result<NonNull<u8>, AllocError> {
 ///
 /// Small-object provenance in v1 is limited to header validation plus that
 /// arena-range/alignment check. Same-arena forgery and small double-free remain
-/// outside guaranteed detection.
+/// outside guaranteed detection, so violating the safety contract can still be UB even
+/// when an error is returned for some invalid pointers.
 pub unsafe fn deallocate(ptr: NonNull<u8>) -> Result<(), FreeError> {
     with_thread_cache(|allocator, cache| {
         // SAFETY: the caller guarantees that `ptr` is a live allocation from this

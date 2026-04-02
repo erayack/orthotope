@@ -1,19 +1,29 @@
 use crate::header::HEADER_SIZE;
 
+/// Number of fixed small-request classes.
 pub const NUM_CLASSES: usize = 6;
+/// Default block-start alignment used for class sizing.
 pub const BLOCK_ALIGNMENT: usize = 64;
 
+/// Fixed small-allocation classes used by Orthotope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SizeClass {
+    /// Requests in `1..=64`.
     B64,
+    /// Requests in `65..=256`.
     B256,
+    /// Requests in `257..=4096`.
     B4K,
+    /// Requests in `4097..=262_144`.
     B256K,
+    /// Requests in `262_145..=1_048_576`.
     B1M,
+    /// Requests in `1_048_577..=16_777_216`.
     B16M,
 }
 
 impl SizeClass {
+    /// All size classes in ascending order.
     pub const ALL: [Self; NUM_CLASSES] = [
         Self::B64,
         Self::B256,
@@ -24,6 +34,7 @@ impl SizeClass {
     ];
 
     #[must_use]
+    /// Maps a request size to its small-allocation class, or `None` for zero and large requests.
     pub const fn from_request(size: usize) -> Option<Self> {
         match size {
             1..=64 => Some(Self::B64),
@@ -37,6 +48,7 @@ impl SizeClass {
     }
 
     #[must_use]
+    /// Returns the maximum user payload size, in bytes, for this class.
     pub const fn payload_size(self) -> usize {
         match self {
             Self::B64 => 64,
@@ -49,11 +61,13 @@ impl SizeClass {
     }
 
     #[must_use]
+    /// Returns the full allocator block size for this class, including header space.
     pub const fn block_size(self) -> usize {
         align_up(self.payload_size() + HEADER_SIZE, BLOCK_ALIGNMENT)
     }
 
     #[must_use]
+    /// Returns the stable dense array index for this class.
     pub const fn index(self) -> usize {
         match self {
             Self::B64 => 0,
@@ -66,6 +80,7 @@ impl SizeClass {
     }
 
     #[must_use]
+    /// Returns the largest request still handled by the small-allocation path.
     pub const fn max_small_request() -> usize {
         Self::B16M.payload_size()
     }

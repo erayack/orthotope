@@ -1,10 +1,14 @@
+//! Allocation-header layout and pointer conversions used for deallocation routing.
+
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
 
 use crate::error::FreeError;
 use crate::size_class::SizeClass;
 
+/// Alignment required for allocation headers and block starts.
 pub const HEADER_ALIGNMENT: usize = 64;
+/// Bytes reserved for allocator metadata at the start of every block.
 pub const HEADER_SIZE: usize = 64;
 
 const HEADER_MAGIC: u32 = 0x4f52_5448;
@@ -12,6 +16,7 @@ const LARGE_CLASS_SENTINEL: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
+/// Decoded allocation kind stored in the header.
 pub(crate) enum AllocationKind {
     Small(SizeClass),
     Large,
@@ -27,6 +32,7 @@ enum AllocationKindTag {
 #[derive(Clone, Copy, Debug)]
 #[repr(C, align(64))]
 #[allow(dead_code)]
+/// Fixed header written at the start of every live allocation block.
 pub(crate) struct AllocationHeader {
     magic: u32,
     kind: AllocationKindTag,

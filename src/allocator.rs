@@ -14,6 +14,10 @@ use crate::large_object::LargeObjectAllocator;
 use crate::size_class::SizeClass;
 use crate::thread_cache::ThreadCache;
 
+/// Standalone allocator instance with its own arena, central pool, and large-object registry.
+///
+/// Share one allocator across threads and keep one [`ThreadCache`] per participating
+/// thread when using the instance-oriented API directly.
 pub struct Allocator {
     config: AllocatorConfig,
     arena: Arena,
@@ -51,6 +55,7 @@ impl Allocator {
     }
 
     #[must_use]
+    /// Returns the configuration used to construct this allocator.
     pub const fn config(&self) -> &AllocatorConfig {
         &self.config
     }
@@ -69,6 +74,8 @@ impl Allocator {
     }
 
     /// Allocates a block using the provided thread-local cache for small objects.
+    ///
+    /// Callers should pair one mutable [`ThreadCache`] with one thread.
     ///
     /// # Errors
     ///
@@ -94,7 +101,8 @@ impl Allocator {
     /// # Safety
     ///
     /// `user_ptr` must be a live pointer returned by this allocator instance and must
-    /// not have been freed already.
+    /// not have been freed already. `cache` must be the caller's thread-local cache for
+    /// this allocator participation.
     ///
     /// # Errors
     ///
@@ -121,7 +129,8 @@ impl Allocator {
     /// # Safety
     ///
     /// `user_ptr` must be a live pointer returned by this allocator instance and must
-    /// not have been freed already.
+    /// not have been freed already. `cache` must be the caller's thread-local cache for
+    /// this allocator participation.
     ///
     /// # Errors
     ///

@@ -6,17 +6,21 @@ use crate::config::AllocatorConfig;
 use crate::free_list::FreeList;
 use crate::size_class::{NUM_CLASSES, SizeClass};
 
+/// Caller-owned per-thread cache for small-object reuse.
+///
+/// Use one `ThreadCache` per participating thread when calling [`Allocator`] methods
+/// directly. The process-global convenience API manages this internally.
 pub struct ThreadCache {
     lists: [FreeList; NUM_CLASSES],
     config: AllocatorConfig,
 }
 
 impl ThreadCache {
-    #[must_use]
     /// Creates a caller-owned thread-local cache for use with a specific [`Allocator`].
     ///
     /// Pair one `ThreadCache` with one thread when using the instance-oriented API
     /// directly. The global convenience API manages this cache internally.
+    #[must_use]
     pub fn new(config: AllocatorConfig) -> Self {
         Self {
             lists: core::array::from_fn(|_| FreeList::new()),

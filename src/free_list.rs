@@ -7,12 +7,14 @@ struct FreeBlock {
 }
 
 #[allow(dead_code)]
+/// Intrusive LIFO list of detached allocator blocks.
 pub(crate) struct FreeList {
     head: Option<NonNull<FreeBlock>>,
     len: usize,
 }
 
 #[allow(dead_code)]
+/// Detached block chain used for O(1) transfers between lists.
 pub(crate) struct Batch {
     head: Option<NonNull<FreeBlock>>,
     tail: Option<NonNull<FreeBlock>>,
@@ -31,16 +33,19 @@ unsafe impl Send for Batch {}
 #[allow(dead_code)]
 impl FreeList {
     #[must_use]
+    /// Creates an empty free list.
     pub(crate) const fn new() -> Self {
         Self { head: None, len: 0 }
     }
 
     #[must_use]
+    /// Returns the number of linked blocks.
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
 
     #[must_use]
+    /// Returns `true` when the list has no blocks.
     pub(crate) const fn is_empty(&self) -> bool {
         self.head.is_none()
     }
@@ -159,6 +164,7 @@ impl FreeList {
 #[allow(dead_code)]
 impl Batch {
     #[must_use]
+    /// Creates an empty detached batch.
     pub(crate) const fn empty() -> Self {
         Self {
             head: None,
@@ -168,11 +174,13 @@ impl Batch {
     }
 
     #[must_use]
+    /// Returns the number of blocks in the batch.
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
 
     #[must_use]
+    /// Returns `true` when the batch has no blocks.
     pub(crate) const fn is_empty(&self) -> bool {
         self.head.is_none()
     }
