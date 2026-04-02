@@ -73,12 +73,13 @@ Small-request classes:
 
 ## Benchmarking
 
-Benchmark results are summarized in [`benchmark.md`](benchmark.md).
+Benchmark results are summarized in [`benchmark`](BENCHMARK.md).
 
 In the current local run, Orthotope was:
 
 - about `1.5x` to `13x` faster on same-thread hot-path reuse workloads
 - about `1.1x` to `3x` faster on `embedding_batch`
 - about `3x` to `4.5x` faster on `mixed_size_churn` against `jemalloc` and `mimalloc`
+- about `3x` faster on `long_lived_handoff`
 
 The current `large_path` benchmark favored the comparison allocators.
