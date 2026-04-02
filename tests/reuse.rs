@@ -115,7 +115,7 @@ fn class_boundary_crossing_does_not_reuse_smaller_block() {
 }
 
 #[test]
-fn requests_above_small_limit_use_large_path_without_cache_reuse() {
+fn requests_above_small_limit_reuse_freed_large_block() {
     let (allocator, mut cache) = allocator_and_cache();
     let request = SizeClass::max_small_request() + 1;
 
@@ -135,7 +135,7 @@ fn requests_above_small_limit_use_large_path_without_cache_reuse() {
         Err(error) => panic!("expected second large allocation to succeed: {error}"),
     };
 
-    assert_ne!(first, second);
+    assert_eq!(first, second);
 
     // SAFETY: `second` is a live large allocation returned by this allocator.
     match unsafe { allocator.deallocate_with_size_checked(&mut cache, second, request) } {

@@ -25,5 +25,5 @@ These are local measurements, useful for relative direction rather than universa
 ## Interpretation Notes
 - Orthotope's strong same-thread results align with the intended architecture: thread-local caches, class-normalized reuse, and efficient hot-path header refresh.
 - The cross-thread benchmark currently measures thread spawning, handoff, and allocator interaction collectively. Orthotope's per-iteration allocator recreation for that workload prevents the arena from exhausting during Criterion warmup, but it also means the benchmark is not a pure central-pool measurement.
-- The large-allocation benchmark is not directly comparable to the small-object path. Orthotope's v1 large path does not reuse freed large allocations, so the current harness recreates the allocator state for Orthotope in that scenario as well.
+- The large-allocation benchmark is not directly comparable to the small-object path. Orthotope now reuses freed large arena spans on a fit basis without coalescing, so benchmark setups should avoid recreating allocator state unless they specifically want cold-path measurements.
 - The mixed_size_churn/system run exhibited high variance in this capture. Consider its range as a noisy result rather than a stable point estimate.

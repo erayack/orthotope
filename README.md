@@ -55,6 +55,8 @@ cache across allocators panics instead of silently rehoming cached blocks.
 - default alignment is `64` bytes
 - custom allocator alignment must be a power of two and at least `64` bytes
 - the global convenience API uses `AllocatorConfig::default()`
+- freed large allocations return to an arena-backed reusable pool for later
+  same-size or smaller large requests
 
 Small-object provenance in v1 is limited to header validation plus an arena-range
 ownership check on the decoded block start. Foreign pointers are rejected where
@@ -62,7 +64,9 @@ detectable, but small-object double free remains undefined behavior and same-are
 pointer forgery is not guaranteed to be detected.
 
 Large allocations are also tracked in a live registry. Duplicate large frees are rejected
-when the pointer still decodes to a valid large-allocation header.
+when the pointer still decodes to a valid large-allocation header, and successful large
+frees return those arena-backed spans to fit-based reuse for future same-size or smaller
+large requests.
 
 Small-request classes:
 

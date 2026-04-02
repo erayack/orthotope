@@ -256,7 +256,15 @@ impl Allocator {
                     requested: requested_size,
                     remaining: self.arena.remaining(),
                 })?;
-        let block_start = self.arena.allocate_block(block_size)?;
+        let (block_start, actual_block_size, usable_size) =
+            self.large.take_reusable_block(block_size).map_or_else(
+                || {
+                    self.arena
+                        .allocate_block(block_size)
+                        .map(|block_start| (block_start, block_size, usable_size))
+                },
+                |block| Ok((block.block_start(), block.block_size, block.usable_size())),
+            )?;
         let header = AllocationHeader::new_large(requested_size, usable_size).ok_or_else(|| {
             AllocError::OutOfMemory {
                 requested: requested_size,
@@ -266,8 +274,13 @@ impl Allocator {
         let _ = header.write_to_block(block_start);
 
         let user_ptr = user_ptr_from_block_start(block_start);
-        self.large
-            .record_live_allocation(user_ptr, requested_size, usable_size);
+        self.large.record_live_allocation(
+            user_ptr,
+            block_start,
+            actual_block_size,
+            requested_size,
+            usable_size,
+        );
 
         Ok(user_ptr)
     }

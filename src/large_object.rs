@@ -9,13 +9,40 @@ use crate::error::FreeError;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Live-registry entry for one large allocation.
 pub(crate) struct LargeAllocationRecord {
+    pub(crate) block_addr: usize,
+    pub(crate) block_size: usize,
     pub(crate) requested_size: usize,
     pub(crate) usable_size: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FreeLargeBlock {
+    pub(crate) block_addr: usize,
+    pub(crate) block_size: usize,
+}
+
+impl FreeLargeBlock {
+    #[must_use]
+    pub(crate) const fn usable_size(self) -> usize {
+        self.block_size - crate::header::HEADER_SIZE
+    }
+
+    #[must_use]
+    pub(crate) fn block_start(self) -> NonNull<u8> {
+        let ptr = self.block_addr as *mut u8;
+        NonNull::new(ptr).unwrap_or_else(|| panic!("stored free large block address was null"))
+    }
+}
+
+#[derive(Default)]
+struct LargeObjectState {
+    live: HashMap<usize, LargeAllocationRecord>,
+    free: Vec<FreeLargeBlock>,
+}
+
 /// Tracks live allocations larger than the largest small class.
 pub(crate) struct LargeObjectAllocator {
-    live: Mutex<HashMap<usize, LargeAllocationRecord>>,
+    state: Mutex<LargeObjectState>,
 }
 
 impl LargeObjectAllocator {
@@ -23,14 +50,30 @@ impl LargeObjectAllocator {
     /// Creates an empty large-allocation registry.
     pub(crate) fn new() -> Self {
         Self {
-            live: Mutex::new(HashMap::new()),
+            state: Mutex::new(LargeObjectState::default()),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn take_reusable_block(&self, minimum_block_size: usize) -> Option<FreeLargeBlock> {
+        let mut state = self.state.lock();
+        let best_fit_index = state
+            .free
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.block_size >= minimum_block_size)
+            .min_by_key(|(_, block)| block.block_size)
+            .map(|(index, _)| index)?;
+
+        Some(state.free.swap_remove(best_fit_index))
     }
 
     /// Records one newly allocated large block as live.
     pub(crate) fn record_live_allocation(
         &self,
         user_ptr: NonNull<u8>,
+        block_start: NonNull<u8>,
+        block_size: usize,
         requested_size: usize,
         usable_size: usize,
     ) {
@@ -38,11 +81,13 @@ impl LargeObjectAllocator {
         debug_assert!(usable_size >= requested_size);
 
         let record = LargeAllocationRecord {
+            block_addr: block_start.as_ptr().addr(),
+            block_size,
             requested_size,
             usable_size,
         };
 
-        match self.live.lock().entry(user_ptr.as_ptr().addr()) {
+        match self.state.lock().live.entry(user_ptr.as_ptr().addr()) {
             Entry::Vacant(entry) => {
                 entry.insert(record);
             }
@@ -65,8 +110,8 @@ impl LargeObjectAllocator {
         requested_size: usize,
         usable_size: usize,
     ) -> Result<(), FreeError> {
-        let mut live = self.live.lock();
-        let Some(record) = live.get(&user_ptr.as_ptr().addr()).copied() else {
+        let mut state = self.state.lock();
+        let Some(record) = state.live.get(&user_ptr.as_ptr().addr()).copied() else {
             return Err(FreeError::AlreadyFreedOrUnknownLarge);
         };
 
@@ -74,8 +119,12 @@ impl LargeObjectAllocator {
             return Err(FreeError::CorruptHeader);
         }
 
-        let removed = live.remove(&user_ptr.as_ptr().addr());
-        drop(live);
+        let removed = state.live.remove(&user_ptr.as_ptr().addr());
+        state.free.push(FreeLargeBlock {
+            block_addr: record.block_addr,
+            block_size: record.block_size,
+        });
+        drop(state);
         debug_assert!(removed.is_some(), "validated live record must still exist");
         Ok(())
     }
@@ -83,13 +132,19 @@ impl LargeObjectAllocator {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn live_len(&self) -> usize {
-        self.live.lock().len()
+        self.state.lock().live.len()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn free_len(&self) -> usize {
+        self.state.lock().free.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LargeAllocationRecord, LargeObjectAllocator};
+    use super::{FreeLargeBlock, LargeAllocationRecord, LargeObjectAllocator};
     use crate::error::FreeError;
     use crate::header::{HEADER_SIZE, user_ptr_from_block_start};
     use core::alloc::Layout;
@@ -145,11 +200,19 @@ mod tests {
         let block_start = block.block_start();
         let user_ptr = user_ptr_from_block_start(block_start);
         let record = LargeAllocationRecord {
+            block_addr: block_start.as_ptr().addr(),
+            block_size: block.size,
             requested_size,
             usable_size,
         };
 
-        allocator.record_live_allocation(user_ptr, record.requested_size, record.usable_size);
+        allocator.record_live_allocation(
+            user_ptr,
+            block_start,
+            record.block_size,
+            record.requested_size,
+            record.usable_size,
+        );
 
         (user_ptr, record)
     }
@@ -170,6 +233,7 @@ mod tests {
 
         assert_eq!(released, Ok(()));
         assert_eq!(allocator.live_len(), 0);
+        assert_eq!(allocator.free_len(), 1);
     }
 
     #[test]
@@ -230,6 +294,7 @@ mod tests {
         );
         assert_eq!(release, Ok(()));
         assert_eq!(allocator.live_len(), 0);
+        assert_eq!(allocator.free_len(), 1);
     }
 
     #[test]
@@ -262,6 +327,79 @@ mod tests {
         );
         assert_eq!(second, Ok(()));
         assert_eq!(allocator.live_len(), 0);
+        assert_eq!(allocator.free_len(), 2);
+    }
+
+    #[test]
+    fn reusable_block_prefers_smallest_sufficient_free_span() {
+        let allocator = LargeObjectAllocator::new();
+        let first = TestBlock::new(HEADER_SIZE + 16_777_280);
+        let second = TestBlock::new(HEADER_SIZE + 20_000_000);
+        let third = TestBlock::new(HEADER_SIZE + 18_000_000);
+
+        let first_block = FreeLargeBlock {
+            block_addr: first.block_start().as_ptr().addr(),
+            block_size: first.size,
+        };
+        let second_block = FreeLargeBlock {
+            block_addr: second.block_start().as_ptr().addr(),
+            block_size: second.size,
+        };
+        let third_block = FreeLargeBlock {
+            block_addr: third.block_start().as_ptr().addr(),
+            block_size: third.size,
+        };
+
+        let user_ptr = user_ptr_from_block_start(first.block_start());
+        allocator.record_live_allocation(
+            user_ptr,
+            first.block_start(),
+            first.size,
+            16_777_217,
+            first.size - HEADER_SIZE,
+        );
+        let _ = allocator.validate_and_release_live_allocation(
+            user_ptr,
+            16_777_217,
+            first.size - HEADER_SIZE,
+        );
+
+        let user_ptr = user_ptr_from_block_start(second.block_start());
+        allocator.record_live_allocation(
+            user_ptr,
+            second.block_start(),
+            second.size,
+            19_999_937,
+            second.size - HEADER_SIZE,
+        );
+        let _ = allocator.validate_and_release_live_allocation(
+            user_ptr,
+            19_999_937,
+            second.size - HEADER_SIZE,
+        );
+
+        let user_ptr = user_ptr_from_block_start(third.block_start());
+        allocator.record_live_allocation(
+            user_ptr,
+            third.block_start(),
+            third.size,
+            17_999_937,
+            third.size - HEADER_SIZE,
+        );
+        let _ = allocator.validate_and_release_live_allocation(
+            user_ptr,
+            17_999_937,
+            third.size - HEADER_SIZE,
+        );
+
+        let reused = allocator
+            .take_reusable_block(HEADER_SIZE + 17_000_000)
+            .unwrap_or_else(|| panic!("expected a reusable large block"));
+
+        assert_eq!(reused, third_block);
+        assert_ne!(reused, first_block);
+        assert_ne!(reused, second_block);
+        assert!(reused.usable_size() >= 17_000_000);
     }
 
     #[test]
@@ -273,6 +411,13 @@ mod tests {
         let usable_size = block_size - HEADER_SIZE;
         let (user_ptr, expected) = live_record(&allocator, &block, 16_777_217, usable_size);
 
-        allocator.record_live_allocation(user_ptr, expected.requested_size, expected.usable_size);
+        allocator.record_live_allocation(
+            user_ptr,
+            NonNull::new(expected.block_addr as *mut u8)
+                .unwrap_or_else(|| panic!("expected live record block address to remain non-null")),
+            expected.block_size,
+            expected.requested_size,
+            expected.usable_size,
+        );
     }
 }
