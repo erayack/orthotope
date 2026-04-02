@@ -36,9 +36,10 @@ pub fn allocate(size: usize) -> Result<NonNull<u8>, AllocError> {
 /// [`FreeError::AlreadyFreedOrUnknownLarge`] for unknown large frees.
 ///
 /// Small-object provenance in v1 is limited to header validation plus that
-/// arena-range/alignment check. Same-arena forgery and small double-free remain
-/// outside guaranteed detection, so violating the safety contract can still be UB even
-/// when an error is returned for some invalid pointers.
+/// arena-range/alignment check. Same-arena forgery, small double-free, and stale large
+/// pointers after address reuse remain outside guaranteed detection, so violating the
+/// safety contract can still be UB even when an error is returned for some invalid
+/// pointers.
 pub unsafe fn deallocate(ptr: NonNull<u8>) -> Result<(), FreeError> {
     with_thread_cache(|allocator, cache| {
         // SAFETY: the caller guarantees that `ptr` is a live allocation from this

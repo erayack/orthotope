@@ -125,7 +125,8 @@ impl Allocator {
     ///
     /// Small-object provenance in v1 is limited to header validation plus an
     /// arena-range/alignment check on the decoded block start. This intentionally
-    /// does not promise full same-arena forgery or duplicate-free detection.
+    /// does not promise full same-arena forgery, duplicate-free detection for small
+    /// allocations, or stale large-pointer detection after address reuse.
     pub unsafe fn deallocate_with_cache(
         &self,
         cache: &mut ThreadCache,

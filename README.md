@@ -64,9 +64,13 @@ detectable, but small-object double free remains undefined behavior and same-are
 pointer forgery is not guaranteed to be detected.
 
 Large allocations are also tracked in a live registry. Duplicate large frees are rejected
-when the pointer still decodes to a valid large-allocation header, and successful large
-frees return those arena-backed spans to fit-based reuse for future same-size or smaller
-large requests.
+when the pointer still decodes to a valid large-allocation header for the same live
+allocation instance, and successful large frees return those arena-backed spans to
+fit-based reuse for future same-size or smaller large requests.
+
+Because large blocks may later be reused at the same address, stale large pointers after
+address reuse are not guaranteed to be distinguishable by the raw-pointer free API.
+Using such pointers still violates the `unsafe` contract.
 
 Small-request classes:
 
