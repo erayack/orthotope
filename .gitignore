@@ -3,3 +3,5 @@ Cargo.lock
 docs/
 .repo_ignore
 reference/
+AGENTS.md
+plan.md
