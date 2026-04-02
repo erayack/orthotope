@@ -49,6 +49,7 @@ calling `Allocator::allocate_with_cache` or `Allocator::deallocate_with_cache` d
 ## Behavior
 
 - small allocations use thread-local reuse first, then central-pool refill, then arena carving
+- small-cache arena refill reserves one contiguous span and splits it locally into class-sized blocks
 - frees are routed by a 64-byte allocation header
 - requests above `16 MiB` use the large-allocation path
 - default alignment is `64` bytes

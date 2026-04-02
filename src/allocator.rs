@@ -184,36 +184,27 @@ impl Allocator {
     ) -> Result<usize, AllocError> {
         let block_size = class.block_size();
         let refill_count = self.config.refill_count(class);
-        let refill_header =
-            AllocationHeader::new_small(class, class.payload_size()).ok_or_else(|| {
-                AllocError::OutOfMemory {
-                    requested: class.payload_size(),
-                    remaining: self.arena.remaining(),
-                }
-            })?;
-        let mut carved = 0;
+        let Some(span) = self.reserve_refill_span(block_size, refill_count, requested_size)? else {
+            return Err(AllocError::OutOfMemory {
+                requested: requested_size,
+                remaining: self.arena.remaining(),
+            });
+        };
 
-        for _ in 0..refill_count {
-            let block_start = match self.arena.allocate_block(block_size) {
-                Ok(block_start) => block_start,
-                Err(AllocError::OutOfMemory { .. }) if carved > 0 => break,
-                Err(AllocError::OutOfMemory { remaining, .. }) => {
-                    return Err(AllocError::OutOfMemory {
-                        requested: requested_size,
-                        remaining,
-                    });
-                }
-                Err(AllocError::GlobalInitFailed) => return Err(AllocError::GlobalInitFailed),
-                Err(AllocError::ZeroSize) => return Err(AllocError::ZeroSize),
-            };
-            let _ = refill_header.write_to_block(block_start);
+        let carved = span.size() / block_size;
+        let span_start = span.start().as_ptr();
 
-            // SAFETY: the arena returned a unique block start for this size class, the
-            // header has been initialized, and the block is not linked in any list yet.
+        for index in 0..carved {
+            let offset = index * block_size;
+            let block_start = span_start.wrapping_add(offset);
+            // SAFETY: `span` is an exclusive reservation from the arena and `offset`
+            // advances in exact block-size steps within the reserved range.
+            let block_start = unsafe { NonNull::new_unchecked(block_start) };
+            // SAFETY: each split block is unique, detached, and large enough for the
+            // intrusive free-list node. Small headers are materialized on live allocation.
             unsafe {
                 cache.push(class, block_start);
             }
-            carved += 1;
         }
 
         Ok(carved)
@@ -329,6 +320,52 @@ impl Allocator {
         let header = unsafe { header_ptr.as_ptr().read() };
         let kind = header.validate()?;
         Ok((header, kind))
+    }
+
+    fn reserve_refill_span(
+        &self,
+        block_size: usize,
+        refill_count: usize,
+        requested_size: usize,
+    ) -> Result<Option<crate::arena::ReservedSpan>, AllocError> {
+        let requested_span_size =
+            block_size
+                .checked_mul(refill_count)
+                .ok_or_else(|| AllocError::OutOfMemory {
+                    requested: requested_size,
+                    remaining: self.arena.remaining(),
+                })?;
+
+        match self.arena.reserve_span(requested_span_size) {
+            Ok(span) => Ok(Some(span)),
+            Err(AllocError::OutOfMemory { remaining, .. }) => {
+                let mut reduced_count = remaining / block_size;
+
+                while reduced_count > 0 {
+                    let reduced_span_size =
+                        block_size
+                            .checked_mul(reduced_count)
+                            .ok_or(AllocError::OutOfMemory {
+                                requested: requested_size,
+                                remaining,
+                            })?;
+                    match self.arena.reserve_span(reduced_span_size) {
+                        Ok(span) => return Ok(Some(span)),
+                        Err(AllocError::OutOfMemory { .. }) => {
+                            reduced_count -= 1;
+                        }
+                        Err(AllocError::GlobalInitFailed) => {
+                            return Err(AllocError::GlobalInitFailed);
+                        }
+                        Err(AllocError::ZeroSize) => return Err(AllocError::ZeroSize),
+                    }
+                }
+
+                Ok(None)
+            }
+            Err(AllocError::GlobalInitFailed) => Err(AllocError::GlobalInitFailed),
+            Err(AllocError::ZeroSize) => Err(AllocError::ZeroSize),
+        }
     }
 }
 

@@ -14,8 +14,27 @@ const fn tiny_config() -> AllocatorConfig {
     }
 }
 
+const fn partial_refill_config() -> AllocatorConfig {
+    AllocatorConfig {
+        arena_size: 768,
+        alignment: 256,
+        refill_target_bytes: 384,
+        local_cache_target_bytes: 128,
+    }
+}
+
 fn allocator_and_cache() -> (Allocator, ThreadCache) {
     let allocator = match Allocator::new(tiny_config()) {
+        Ok(allocator) => allocator,
+        Err(error) => panic!("expected allocator to initialize: {error}"),
+    };
+    let cache = ThreadCache::new(*allocator.config());
+
+    (allocator, cache)
+}
+
+fn allocator_and_cache_with(config: AllocatorConfig) -> (Allocator, ThreadCache) {
+    let allocator = match Allocator::new(config) {
         Ok(allocator) => allocator,
         Err(error) => panic!("expected allocator to initialize: {error}"),
     };
@@ -126,5 +145,44 @@ fn oversized_large_request_returns_typed_out_of_memory() {
         }
         Err(AllocError::ZeroSize) => panic!("unexpected zero-size error for non-zero request"),
         Ok(_) => panic!("expected oversized large request to exhaust the tiny arena"),
+    }
+}
+
+#[test]
+fn partial_refill_retries_smaller_batch_after_alignment_loss() {
+    let (allocator, mut cache) = allocator_and_cache_with(partial_refill_config());
+
+    match allocator.allocate_with_cache(&mut cache, 1) {
+        Ok(_) => {}
+        Err(error) => panic!("expected first allocation to succeed: {error}"),
+    }
+    match allocator.allocate_with_cache(&mut cache, 1) {
+        Ok(_) => {}
+        Err(error) => panic!("expected second allocation to succeed: {error}"),
+    }
+    match allocator.allocate_with_cache(&mut cache, 1) {
+        Ok(_) => {}
+        Err(error) => panic!("expected third allocation to succeed: {error}"),
+    }
+
+    match allocator.allocate_with_cache(&mut cache, 1) {
+        Ok(_) => {}
+        Err(error) => panic!("expected partial-refill allocation to succeed: {error}"),
+    }
+    match allocator.allocate_with_cache(&mut cache, 1) {
+        Ok(_) => {}
+        Err(error) => panic!("expected second partial-refill allocation to succeed: {error}"),
+    }
+
+    match allocator.allocate_with_cache(&mut cache, 1) {
+        Err(AllocError::OutOfMemory {
+            requested,
+            remaining,
+        }) => {
+            assert_eq!(requested, 1);
+            assert_eq!(remaining, 0);
+        }
+        Err(error) => panic!("unexpected allocation error after partial refill: {error}"),
+        Ok(_) => panic!("expected allocator to exhaust after the largest fitting partial refill"),
     }
 }

@@ -14,6 +14,11 @@ pub struct Arena {
     alignment: usize,
 }
 
+pub(crate) struct ReservedSpan {
+    start: NonNull<u8>,
+    size: usize,
+}
+
 // SAFETY: `Arena` owns its mapping, never exposes mutable aliases to that mapping, and
 // coordinates shared allocation progress exclusively through the atomic `next` cursor.
 unsafe impl Send for Arena {}
@@ -61,6 +66,16 @@ impl Arena {
     /// Returns [`AllocError::OutOfMemory`] if the aligned reservation would
     /// exceed the arena bounds or if alignment arithmetic overflows.
     pub fn allocate_block(&self, size: usize) -> Result<NonNull<u8>, AllocError> {
+        Ok(self.reserve_span(size)?.start())
+    }
+
+    /// Reserves one contiguous aligned span from the arena.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocError::OutOfMemory`] if the aligned reservation would
+    /// exceed the arena bounds or if alignment arithmetic overflows.
+    pub(crate) fn reserve_span(&self, size: usize) -> Result<ReservedSpan, AllocError> {
         if size == 0 {
             return Err(AllocError::ZeroSize);
         }
@@ -94,7 +109,8 @@ impl Arena {
                 let ptr = self.base.as_ptr().wrapping_add(aligned);
                 // SAFETY: `aligned <= self.len` and `end <= self.len` were proven above,
                 // so the derived pointer stays within the mapped arena and cannot be null.
-                return Ok(unsafe { NonNull::new_unchecked(ptr) });
+                let start = unsafe { NonNull::new_unchecked(ptr) };
+                return Ok(ReservedSpan { start, size });
             }
         }
     }
@@ -119,6 +135,18 @@ impl Arena {
         // must land inside this arena and respect the arena alignment. It does not
         // prove that the block is currently live or uniquely owned.
         addr >= start && addr < end && (addr - start).is_multiple_of(self.alignment)
+    }
+}
+
+impl ReservedSpan {
+    #[must_use]
+    pub(crate) const fn start(&self) -> NonNull<u8> {
+        self.start
+    }
+
+    #[must_use]
+    pub(crate) const fn size(&self) -> usize {
+        self.size
     }
 }
 

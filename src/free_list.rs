@@ -15,6 +15,7 @@ pub(crate) struct FreeList {
 #[allow(dead_code)]
 pub(crate) struct Batch {
     head: Option<NonNull<FreeBlock>>,
+    tail: Option<NonNull<FreeBlock>>,
     len: usize,
 }
 
@@ -92,28 +93,20 @@ impl FreeList {
     /// other free list and whose storage is large enough for `FreeBlock`.
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) unsafe fn push_batch(&mut self, batch: Batch) {
-        let Batch { head, len } = batch;
+        let Batch { head, tail, len } = batch;
         if len == 0 {
             return;
         }
 
-        let mut tail = head.unwrap_or_else(|| unreachable!("non-empty batch must have a head"));
-        for _ in 1..len {
-            // SAFETY: `batch` is guaranteed to be a valid detached chain of `batch.len`
-            // nodes, so traversing exactly `len - 1` next pointers reaches the tail.
-            tail = unsafe {
-                tail.as_ref()
-                    .next
-                    .unwrap_or_else(|| unreachable!("batch chain shorter than recorded length"))
-            };
-        }
+        let head = head.unwrap_or_else(|| unreachable!("non-empty batch must have a head"));
+        let mut tail = tail.unwrap_or_else(|| unreachable!("non-empty batch must have a tail"));
 
         // SAFETY: `tail` is the last node in the detached batch, so wiring it to this
         // list head splices the entire batch in front without disturbing batch order.
         unsafe {
             tail.as_mut().next = self.head;
         }
-        self.head = head;
+        self.head = Some(head);
         self.len += len;
     }
 
@@ -157,6 +150,7 @@ impl FreeList {
 
         Batch {
             head: Some(head),
+            tail: Some(tail),
             len: take,
         }
     }
@@ -166,7 +160,11 @@ impl FreeList {
 impl Batch {
     #[must_use]
     pub(crate) const fn empty() -> Self {
-        Self { head: None, len: 0 }
+        Self {
+            head: None,
+            tail: None,
+            len: 0,
+        }
     }
 
     #[must_use]
