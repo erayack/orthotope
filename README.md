@@ -43,6 +43,8 @@ Only free live pointers returned by Orthotope. Small-object double free remains 
 For direct instance-oriented use, the crate also exposes `Allocator`, `AllocatorConfig`,
 `ThreadCache`, and `SizeClass` at the crate root. Use one `ThreadCache` per thread when
 calling `Allocator::allocate_with_cache` or `Allocator::deallocate_with_cache` directly.
+An empty cache may be rebound to a different allocator instance, but reusing a non-empty
+cache across allocators panics instead of silently rehoming cached blocks.
 
 ## Behavior
 

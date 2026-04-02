@@ -13,6 +13,7 @@ use crate::size_class::{NUM_CLASSES, SizeClass};
 pub struct ThreadCache {
     lists: [FreeList; NUM_CLASSES],
     config: AllocatorConfig,
+    owner: Option<usize>,
 }
 
 impl ThreadCache {
@@ -25,7 +26,28 @@ impl ThreadCache {
         Self {
             lists: core::array::from_fn(|_| FreeList::new()),
             config,
+            owner: None,
         }
+    }
+
+    pub(crate) fn bind_to_allocator(&mut self, allocator: &Allocator) {
+        let owner = allocator.id();
+        if self.owner == Some(owner) {
+            return;
+        }
+
+        assert!(
+            self.is_empty(),
+            "thread cache cannot be reused across allocators while it still holds cached blocks"
+        );
+
+        self.config = *allocator.config();
+        self.owner = Some(owner);
+    }
+
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.lists.iter().all(FreeList::is_empty)
     }
 
     #[must_use]

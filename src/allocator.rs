@@ -1,4 +1,5 @@
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arena::Arena;
 use crate::central_pool::CentralPool;
@@ -14,11 +15,14 @@ use crate::large_object::LargeObjectAllocator;
 use crate::size_class::SizeClass;
 use crate::thread_cache::ThreadCache;
 
+static NEXT_ALLOCATOR_ID: AtomicUsize = AtomicUsize::new(1);
+
 /// Standalone allocator instance with its own arena, central pool, and large-object registry.
 ///
 /// Share one allocator across threads and keep one [`ThreadCache`] per participating
 /// thread when using the instance-oriented API directly.
 pub struct Allocator {
+    id: usize,
     config: AllocatorConfig,
     arena: Arena,
     central: CentralPool,
@@ -47,6 +51,7 @@ impl Allocator {
         let arena = Arena::new(&config)?;
 
         Ok(Self {
+            id: NEXT_ALLOCATOR_ID.fetch_add(1, Ordering::Relaxed),
             config,
             arena,
             central: CentralPool::new(),
@@ -58,6 +63,11 @@ impl Allocator {
     /// Returns the configuration used to construct this allocator.
     pub const fn config(&self) -> &AllocatorConfig {
         &self.config
+    }
+
+    #[must_use]
+    pub(crate) const fn id(&self) -> usize {
+        self.id
     }
 
     pub(crate) fn drain_thread_cache_on_exit(&self, cache: &mut ThreadCache) {
@@ -86,6 +96,8 @@ impl Allocator {
         cache: &mut ThreadCache,
         requested_size: usize,
     ) -> Result<NonNull<u8>, AllocError> {
+        cache.bind_to_allocator(self);
+
         if requested_size == 0 {
             return Err(AllocError::ZeroSize);
         }
@@ -119,6 +131,8 @@ impl Allocator {
         cache: &mut ThreadCache,
         user_ptr: NonNull<u8>,
     ) -> Result<(), FreeError> {
+        cache.bind_to_allocator(self);
+
         // SAFETY: the caller promises that `user_ptr` came from this allocator and is
         // valid to decode as an allocator block header.
         unsafe { self.deallocate_impl(cache, user_ptr, None) }
@@ -145,6 +159,8 @@ impl Allocator {
         user_ptr: NonNull<u8>,
         expected_size: usize,
     ) -> Result<(), FreeError> {
+        cache.bind_to_allocator(self);
+
         // SAFETY: the caller promises that `user_ptr` came from this allocator and is
         // valid to decode as an allocator block header.
         unsafe { self.deallocate_impl(cache, user_ptr, Some(expected_size)) }
