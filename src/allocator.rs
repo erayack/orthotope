@@ -262,6 +262,13 @@ impl Allocator {
                     self.arena
                         .allocate_block(block_size)
                         .map(|block_start| (block_start, block_size, usable_size))
+                        .map_err(|error| match error {
+                            AllocError::OutOfMemory { remaining, .. } => AllocError::OutOfMemory {
+                                requested: requested_size,
+                                remaining,
+                            },
+                            other => other,
+                        })
                 },
                 |block| Ok((block.block_start(), block.block_size, block.usable_size())),
             )?;

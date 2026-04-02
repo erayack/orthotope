@@ -1,7 +1,6 @@
 use orthotope::allocator::Allocator;
 use orthotope::config::AllocatorConfig;
 use orthotope::error::AllocError;
-use orthotope::header::HEADER_SIZE;
 use orthotope::size_class::SizeClass;
 use orthotope::thread_cache::ThreadCache;
 
@@ -41,15 +40,6 @@ fn allocator_and_cache_with(config: AllocatorConfig) -> (Allocator, ThreadCache)
     let cache = ThreadCache::new(*allocator.config());
 
     (allocator, cache)
-}
-
-const fn align_up(value: usize, alignment: usize) -> usize {
-    let remainder = value % alignment;
-    if remainder == 0 {
-        value
-    } else {
-        value + (alignment - remainder)
-    }
 }
 
 #[test]
@@ -130,7 +120,6 @@ fn failed_refill_does_not_poison_reuse_of_freed_block() {
 fn oversized_large_request_returns_typed_out_of_memory() {
     let (allocator, mut cache) = allocator_and_cache();
     let request = SizeClass::max_small_request() + 1;
-    let normalized_block_size = align_up(HEADER_SIZE + request, tiny_config().alignment);
 
     match allocator.allocate_with_cache(&mut cache, request) {
         Err(AllocError::GlobalInitFailed) => {
@@ -140,7 +129,7 @@ fn oversized_large_request_returns_typed_out_of_memory() {
             requested,
             remaining,
         }) => {
-            assert_eq!(requested, normalized_block_size);
+            assert_eq!(requested, request);
             assert_eq!(remaining, tiny_config().arena_size);
         }
         Err(AllocError::ZeroSize) => panic!("unexpected zero-size error for non-zero request"),
