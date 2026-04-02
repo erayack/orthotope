@@ -191,7 +191,7 @@ impl Allocator {
         class: SizeClass,
         requested_size: usize,
     ) -> Result<usize, AllocError> {
-        let block_size = class.block_size();
+        let block_size = class.block_size_for_alignment(self.config.alignment);
         let refill_count = self.config.refill_count(class);
         let Some(span) = self.reserve_refill_span(block_size, refill_count, requested_size)? else {
             return Err(AllocError::OutOfMemory {

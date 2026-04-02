@@ -67,6 +67,12 @@ impl SizeClass {
     }
 
     #[must_use]
+    /// Returns the full allocator block size for this class using `alignment`.
+    pub const fn block_size_for_alignment(self, alignment: usize) -> usize {
+        align_up(self.payload_size() + HEADER_SIZE, alignment)
+    }
+
+    #[must_use]
     /// Returns the stable dense array index for this class.
     pub const fn index(self) -> usize {
         match self {
