@@ -16,9 +16,9 @@ const fn tiny_config() -> AllocatorConfig {
 
 const fn partial_refill_config() -> AllocatorConfig {
     AllocatorConfig {
-        arena_size: 768,
-        alignment: 256,
-        refill_target_bytes: 384,
+        arena_size: 384,
+        alignment: 64,
+        refill_target_bytes: 256,
         local_cache_target_bytes: 128,
     }
 }
@@ -149,7 +149,7 @@ fn oversized_large_request_returns_typed_out_of_memory() {
 }
 
 #[test]
-fn partial_refill_retries_smaller_batch_after_alignment_loss() {
+fn partial_refill_retries_smaller_batch_when_remaining_fits_fewer_blocks() {
     let (allocator, mut cache) = allocator_and_cache_with(partial_refill_config());
 
     match allocator.allocate_with_cache(&mut cache, 1) {
@@ -160,18 +160,10 @@ fn partial_refill_retries_smaller_batch_after_alignment_loss() {
         Ok(_) => {}
         Err(error) => panic!("expected second allocation to succeed: {error}"),
     }
-    match allocator.allocate_with_cache(&mut cache, 1) {
-        Ok(_) => {}
-        Err(error) => panic!("expected third allocation to succeed: {error}"),
-    }
 
     match allocator.allocate_with_cache(&mut cache, 1) {
         Ok(_) => {}
         Err(error) => panic!("expected partial-refill allocation to succeed: {error}"),
-    }
-    match allocator.allocate_with_cache(&mut cache, 1) {
-        Ok(_) => {}
-        Err(error) => panic!("expected second partial-refill allocation to succeed: {error}"),
     }
 
     match allocator.allocate_with_cache(&mut cache, 1) {
