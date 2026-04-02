@@ -20,6 +20,7 @@ These are local measurements, useful for relative direction rather than universa
 | `embedding_batch` | `76.94 ns` | `233.61 ns` | `83.11 ns` | `98.47 ns` |
 | `mixed_size_churn` | `59.56 ns` | `2.17 us` to `4.01 us` | `273.21 ns` | `196.51 ns` |
 | `large_path` | `15.01 us` | `133.86 ns` | `596.31 ns` | `392.90 ns` |
+| `long_lived_handoff` | `4.3387 us` | `12.959 us` | `12.447 us` | `12.805 us` |
 
 ## Interpretation Notes
 - Orthotope's strong same-thread results align with the intended architecture: thread-local caches, class-normalized reuse, and efficient hot-path header refresh.
