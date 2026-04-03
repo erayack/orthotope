@@ -354,6 +354,11 @@ impl LocalSlab {
     }
 
     unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
+        if !self.free.is_empty() {
+            // SAFETY: the slab owns this free list exclusively through `&mut self`.
+            return unsafe { self.free.pop_block() };
+        }
+
         if self.next_fresh < self.capacity {
             let offset = self
                 .next_fresh
@@ -365,8 +370,7 @@ impl LocalSlab {
             return Some(unsafe { NonNull::new_unchecked(block) });
         }
 
-        // SAFETY: the slab owns this free list exclusively through `&mut self`.
-        unsafe { self.free.pop_block() }
+        None
     }
 
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
@@ -380,34 +384,41 @@ impl LocalSlab {
             return Batch::empty();
         }
 
-        if !self.free.is_empty() {
-            // SAFETY: the slab owns this free list exclusively through `&mut self`.
-            return unsafe { self.free.pop_batch(max) };
-        }
-
-        let available_fresh = self.capacity - self.next_fresh;
-        if available_fresh == 0 {
+        if self.free.is_empty() && self.next_fresh == self.capacity {
             return Batch::empty();
         }
 
-        let take = core::cmp::min(max, available_fresh);
-        let start_index = self.next_fresh;
-        self.next_fresh += take;
-
         let mut list = FreeList::new();
-        for index in 0..take {
-            let offset = (start_index + index)
-                .checked_mul(self.block_size)
-                .unwrap_or_else(|| unreachable!("fresh slab batch offset overflowed"));
-            let block = self.start.as_ptr().wrapping_add(offset);
-            // SAFETY: each computed block start lies within this slab and is unique in the batch.
-            let block = unsafe { NonNull::new_unchecked(block) };
-            // SAFETY: each block is detached and valid for this slab's class.
+        let mut taken = 0;
+
+        while taken < max {
+            let block = if !self.free.is_empty() {
+                // SAFETY: the slab owns this free list exclusively through `&mut self`.
+                unsafe { self.free.pop_block() }
+            } else if self.next_fresh < self.capacity {
+                let offset = self
+                    .next_fresh
+                    .checked_mul(self.block_size)
+                    .unwrap_or_else(|| unreachable!("fresh slab batch offset overflowed"));
+                self.next_fresh += 1;
+                let block = self.start.as_ptr().wrapping_add(offset);
+                // SAFETY: the computed block start lies within this slab and is non-null.
+                Some(unsafe { NonNull::new_unchecked(block) })
+            } else {
+                None
+            };
+
+            let Some(block) = block else {
+                break;
+            };
+
+            // SAFETY: each detached block is valid for this slab's class and owned by `list`.
             unsafe { list.push_block(block) };
+            taken += 1;
         }
 
-        // SAFETY: the temporary list now owns exactly `take` valid detached blocks.
-        unsafe { list.pop_batch(take) }
+        // SAFETY: the temporary list now owns exactly `taken` valid detached blocks.
+        unsafe { list.pop_batch(taken) }
     }
 }
 

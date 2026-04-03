@@ -37,14 +37,17 @@ unsafe {
 - `allocate(size)` returns `Result<NonNull<u8>, AllocError>`
 - `deallocate(ptr)` is the primary free path
 - `deallocate_with_size(ptr, size)` validates the recorded size before freeing
+- `global_stats()` returns a best-effort snapshot of the global allocator's shared state
 
 Only free live pointers returned by Orthotope. Small-object double free remains undefined behavior.
 
 For direct instance-oriented use, the crate also exposes `Allocator`, `AllocatorConfig`,
 `ThreadCache`, and `SizeClass` at the crate root. Use one `ThreadCache` per thread when
 calling `Allocator::allocate_with_cache` or `Allocator::deallocate_with_cache` directly.
-An empty cache may be rebound to a different allocator instance, but reusing a non-empty
-cache across allocators panics instead of silently rehoming cached blocks.
+`Allocator::stats()` and `ThreadCache::stats()` expose the same best-effort snapshot model
+for instance-oriented use. An empty cache may be rebound to a different allocator
+instance, but reusing a non-empty cache across allocators panics instead of silently
+rehoming cached blocks.
 
 ## Behavior
 
