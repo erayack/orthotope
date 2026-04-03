@@ -1,7 +1,8 @@
+use std::ptr::NonNull;
 use std::thread;
 
 use orthotope::error::{AllocError, FreeError};
-use orthotope::{allocate, deallocate, deallocate_with_size};
+use orthotope::{SizeClass, allocate, deallocate, deallocate_with_size};
 
 #[test]
 fn public_api_allocates_and_deallocates_small_block() {
@@ -82,5 +83,40 @@ fn same_thread_reuse_works_through_public_api() {
     assert!(
         join_result.is_ok(),
         "expected reuse thread to complete successfully"
+    );
+}
+
+#[test]
+fn public_api_rejects_never_allocated_same_arena_pointer() {
+    let handle = thread::spawn(|| {
+        let ptr = match allocate(32) {
+            Ok(ptr) => ptr,
+            Err(error) => panic!("expected public allocation to succeed: {error}"),
+        };
+        let forged = NonNull::new(ptr.as_ptr().wrapping_add(SizeClass::B64.block_size()))
+            .unwrap_or_else(|| panic!("forged in-arena user pointer should remain non-null"));
+
+        // SAFETY: this intentionally forges a same-arena pointer to an untouched block in
+        // the current thread's local slab to verify the public free API rejects it.
+        let forged_result = unsafe { deallocate_with_size(forged, 1) };
+        assert!(
+            matches!(
+                forged_result,
+                Err(FreeError::CorruptHeader | FreeError::ForeignPointer)
+            ),
+            "forged never-allocated pointer was accepted: {forged_result:?}"
+        );
+
+        // SAFETY: `ptr` is still the only live allocation returned by this thread.
+        match unsafe { deallocate(ptr) } {
+            Ok(()) => {}
+            Err(error) => panic!("expected public cleanup free to succeed: {error}"),
+        }
+    });
+
+    let join_result = handle.join();
+    assert!(
+        join_result.is_ok(),
+        "expected forged-pointer thread to complete successfully"
     );
 }

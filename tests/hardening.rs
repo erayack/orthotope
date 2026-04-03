@@ -190,3 +190,42 @@ fn misaligned_user_pointer_is_rejected_before_header_read() {
     let cleanup = unsafe { allocator.deallocate_with_cache(&mut cache, ptr) };
     assert_eq!(cleanup, Ok(()));
 }
+
+#[test]
+fn never_allocated_same_arena_pointer_is_rejected_before_it_can_alias_live_memory() {
+    let config = AllocatorConfig {
+        refill_target_bytes: 256,
+        ..test_config()
+    };
+    let allocator = match Allocator::new(config) {
+        Ok(allocator) => allocator,
+        Err(error) => panic!("expected allocator to initialize: {error}"),
+    };
+    let mut cache = ThreadCache::new(config);
+    let class = SizeClass::B64;
+    let ptr = match allocator.allocate_with_cache(&mut cache, 32) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected small allocation to succeed: {error}"),
+    };
+
+    let forged = NonNull::new(
+        ptr.as_ptr()
+            .wrapping_add(class.block_size_for_alignment(config.alignment)),
+    )
+    .unwrap_or_else(|| panic!("forged in-arena user pointer should remain non-null"));
+
+    // SAFETY: this intentionally forges a same-arena pointer to a block that was carved
+    // into the slab but has never been allocated to the caller.
+    let result = unsafe { allocator.deallocate_with_cache(&mut cache, forged) };
+    assert!(
+        matches!(
+            result,
+            Err(FreeError::CorruptHeader | FreeError::ForeignPointer)
+        ),
+        "forged never-allocated pointer was accepted: {result:?}"
+    );
+
+    // SAFETY: `ptr` is still the only live allocation returned by this allocator.
+    let cleanup = unsafe { allocator.deallocate_with_cache(&mut cache, ptr) };
+    assert_eq!(cleanup, Ok(()));
+}

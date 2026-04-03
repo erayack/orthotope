@@ -181,9 +181,10 @@ impl AllocationHeader {
         debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
 
         // SAFETY: `header_ptr` names the 64-byte header region at the start of a valid
-        // allocator block, and these writes establish the invariant small-block metadata.
+        // allocator block. Fresh slab entries keep a non-live requested-size marker so
+        // untouched blocks are not accepted by deallocation before first allocation.
         unsafe {
-            Self::write_small_prefix(header_ptr, class_index, 1, usable_size);
+            Self::write_small_prefix(header_ptr, class_index, 0, usable_size);
             ptr::addr_of_mut!((*header_ptr.as_ptr()).padding).write([0; 48]);
         }
 
