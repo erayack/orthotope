@@ -18,7 +18,14 @@ pub struct ThreadCache {
     owner: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockReuse {
+    HeaderIntact,
+    NeedsHeaderRewrite,
+}
+
 struct LocalClassCache {
+    hot_block: Option<NonNull<u8>>,
     slabs: Vec<LocalSlab>,
     available_slabs: Vec<usize>,
     recent_slab: Option<usize>,
@@ -72,7 +79,7 @@ impl ThreadCache {
     }
 
     #[must_use]
-    pub(crate) fn pop(&mut self, class: SizeClass) -> Option<NonNull<u8>> {
+    pub(crate) fn pop(&mut self, class: SizeClass) -> Option<(NonNull<u8>, BlockReuse)> {
         // SAFETY: `ThreadCache` has exclusive mutable access to the class cache.
         unsafe { self.classes[class.index()].pop_block() }
     }
@@ -210,6 +217,7 @@ impl ThreadCache {
 impl LocalClassCache {
     const fn new() -> Self {
         Self {
+            hot_block: None,
             slabs: Vec::new(),
             available_slabs: Vec::new(),
             recent_slab: None,
@@ -238,17 +246,22 @@ impl LocalClassCache {
             .unwrap_or_else(|| unreachable!("local class cache size overflowed"));
     }
 
-    unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
+    unsafe fn pop_block(&mut self) -> Option<(NonNull<u8>, BlockReuse)> {
+        if let Some(block) = self.hot_block.take() {
+            self.total_len -= 1;
+            return Some((block, BlockReuse::HeaderIntact));
+        }
+
         while let Some(&index) = self.available_slabs.last() {
             let slab = &mut self.slabs[index];
             // SAFETY: the slab owns its free storage exclusively while borrowed mutably here.
-            if let Some(block) = unsafe { slab.pop_block() } {
+            if let Some((block, reuse)) = unsafe { slab.pop_block() } {
                 self.recent_slab = Some(index);
                 self.total_len -= 1;
                 if !slab.has_available_blocks() {
                     let _ = self.available_slabs.pop();
                 }
-                return Some(block);
+                return Some((block, reuse));
             }
 
             let _ = self.available_slabs.pop();
@@ -260,10 +273,22 @@ impl LocalClassCache {
             self.shared_len -= 1;
             self.total_len -= 1;
         }
-        block
+        block.map(|block| (block, BlockReuse::NeedsHeaderRewrite))
     }
 
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
+        if let Some(previous_hot) = self.hot_block.replace(block) {
+            self.total_len += 1;
+            // SAFETY: `previous_hot` was detached from the hot slot just above and
+            // remains a valid block for normal class-cache insertion.
+            unsafe { self.push_spilled_block(previous_hot) };
+            return;
+        }
+
+        self.total_len += 1;
+    }
+
+    unsafe fn push_spilled_block(&mut self, block: NonNull<u8>) {
         if let Some(index) = self
             .recent_slab
             .filter(|&index| self.slabs[index].contains(block))
@@ -275,7 +300,6 @@ impl LocalClassCache {
             if was_empty {
                 self.available_slabs.push(index);
             }
-            self.total_len += 1;
             return;
         }
 
@@ -288,14 +312,12 @@ impl LocalClassCache {
             if was_empty {
                 self.available_slabs.push(index);
             }
-            self.total_len += 1;
             return;
         }
 
         // SAFETY: `block` remains a valid detached node for this class in the shared list.
         unsafe { self.shared.push_block(block) };
         self.shared_len += 1;
-        self.total_len += 1;
     }
 
     unsafe fn push_shared_batch(&mut self, batch: Batch) {
@@ -334,6 +356,15 @@ impl LocalClassCache {
             }
 
             let _ = self.available_slabs.pop();
+        }
+
+        if let Some(block) = self.hot_block.take() {
+            let mut list = FreeList::new();
+            // SAFETY: `block` was uniquely owned by the hot slot and is now detached.
+            unsafe { list.push_block(block) };
+            self.total_len -= 1;
+            // SAFETY: the temporary list contains exactly one detached valid block.
+            return unsafe { list.pop_batch(1) };
         }
 
         Batch::empty()
@@ -384,10 +415,11 @@ impl LocalSlab {
 
     /// Pops one block from this slab, preferring reclaimed blocks before untouched
     /// fresh capacity so same-thread frees are reused immediately.
-    unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
+    unsafe fn pop_block(&mut self) -> Option<(NonNull<u8>, BlockReuse)> {
         if !self.free.is_empty() {
             // SAFETY: the slab owns this free list exclusively through `&mut self`.
-            return unsafe { self.free.pop_block() };
+            return unsafe { self.free.pop_block() }
+                .map(|block| (block, BlockReuse::NeedsHeaderRewrite));
         }
 
         if self.next_fresh < self.capacity {
@@ -398,7 +430,10 @@ impl LocalSlab {
             self.next_fresh += 1;
             let block = self.start.as_ptr().wrapping_add(offset);
             // SAFETY: `offset` remains within the slab bounds and `start` is non-null.
-            return Some(unsafe { NonNull::new_unchecked(block) });
+            return Some((
+                unsafe { NonNull::new_unchecked(block) },
+                BlockReuse::HeaderIntact,
+            ));
         }
 
         None
@@ -485,7 +520,7 @@ impl Drop for ThreadCacheHandle {
 
 #[cfg(test)]
 mod tests {
-    use super::{ThreadCache, ThreadCacheHandle};
+    use super::{BlockReuse, ThreadCache, ThreadCacheHandle};
     use crate::allocator::Allocator;
     use crate::central_pool::CentralPool;
     use crate::config::AllocatorConfig;
@@ -711,8 +746,14 @@ mod tests {
         let moved = destination.refill_from_central(SizeClass::B64, &pool);
         assert_eq!(moved, 2);
 
-        assert_eq!(destination.pop(SizeClass::B64), Some(expected[1]));
-        assert_eq!(destination.pop(SizeClass::B64), Some(expected[0]));
+        assert_eq!(
+            destination.pop(SizeClass::B64),
+            Some((expected[1], BlockReuse::NeedsHeaderRewrite))
+        );
+        assert_eq!(
+            destination.pop(SizeClass::B64),
+            Some((expected[0], BlockReuse::NeedsHeaderRewrite))
+        );
         assert_eq!(destination.pop(SizeClass::B64), None);
     }
 

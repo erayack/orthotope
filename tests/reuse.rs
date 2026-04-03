@@ -47,6 +47,29 @@ fn same_thread_small_free_reuses_identical_pointer() {
 }
 
 #[test]
+fn same_thread_64_byte_free_reuses_identical_pointer_via_hot_slot() {
+    let (allocator, mut cache) = allocator_and_cache();
+
+    let first = match allocator.allocate_with_cache(&mut cache, 64) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected first 64-byte allocation to succeed: {error}"),
+    };
+
+    // SAFETY: `first` was allocated above and has not been freed yet.
+    match unsafe { allocator.deallocate_with_cache(&mut cache, first) } {
+        Ok(()) => {}
+        Err(error) => panic!("expected 64-byte free to succeed: {error}"),
+    }
+
+    let second = match allocator.allocate_with_cache(&mut cache, 64) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected second 64-byte allocation to succeed: {error}"),
+    };
+
+    assert_eq!(first, second);
+}
+
+#[test]
 fn reused_block_refreshes_requested_size_within_same_class() {
     let (allocator, mut cache) = allocator_and_cache();
 
@@ -141,5 +164,53 @@ fn requests_above_small_limit_reuse_freed_large_block() {
     match unsafe { allocator.deallocate_with_size_checked(&mut cache, second, request) } {
         Ok(()) => {}
         Err(error) => panic!("expected second large free to succeed: {error}"),
+    }
+}
+
+#[test]
+fn second_same_class_free_spills_previous_hot_block_without_losing_reuse() {
+    let (allocator, mut cache) = allocator_and_cache();
+
+    let first = match allocator.allocate_with_cache(&mut cache, 64) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected first 64-byte allocation to succeed: {error}"),
+    };
+    let second = match allocator.allocate_with_cache(&mut cache, 64) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected second 64-byte allocation to succeed: {error}"),
+    };
+
+    // SAFETY: both pointers are live and belong to this allocator.
+    match unsafe { allocator.deallocate_with_cache(&mut cache, first) } {
+        Ok(()) => {}
+        Err(error) => panic!("expected first free to succeed: {error}"),
+    }
+    // SAFETY: `second` is still live and belongs to this allocator.
+    match unsafe { allocator.deallocate_with_cache(&mut cache, second) } {
+        Ok(()) => {}
+        Err(error) => panic!("expected second free to succeed: {error}"),
+    }
+
+    let reused_hot = match allocator.allocate_with_cache(&mut cache, 64) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected hot-slot reuse allocation to succeed: {error}"),
+    };
+    let reused_spilled = match allocator.allocate_with_cache(&mut cache, 64) {
+        Ok(ptr) => ptr,
+        Err(error) => panic!("expected spilled-block reuse allocation to succeed: {error}"),
+    };
+
+    assert_eq!(reused_hot, second);
+    assert_eq!(reused_spilled, first);
+
+    // SAFETY: both pointers are live and belong to this allocator.
+    match unsafe { allocator.deallocate_with_cache(&mut cache, reused_hot) } {
+        Ok(()) => {}
+        Err(error) => panic!("expected hot-slot cleanup free to succeed: {error}"),
+    }
+    // SAFETY: `reused_spilled` is still live and belongs to this allocator.
+    match unsafe { allocator.deallocate_with_cache(&mut cache, reused_spilled) } {
+        Ok(()) => {}
+        Err(error) => panic!("expected spilled-block cleanup free to succeed: {error}"),
     }
 }

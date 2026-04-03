@@ -12,7 +12,7 @@ Method summary:
 
 ## Overview
 
-- Orthotope led most same-thread hot-path reuse workloads, ranging from about `1.1x` to `7.1x` faster than the comparison allocators depending on size, while `mimalloc` narrowly led the `64`-byte case.
+- Orthotope led the same-thread hot-path reuse workloads captured here, ranging from about `1.03x` to `56.46x` faster than the comparison allocators depending on size.
 - Orthotope also led `embedding_batch`, `mixed_size_churn`, and `large_path`, and still edged out the system/jemalloc variants of `long_lived_handoff`.
 - The medium-size class ladder change removed the previous `embedding_batch` regression without giving up the existing wins in the other local workloads captured here.
 
@@ -21,7 +21,7 @@ Method summary:
 | Workload | Orthotope | System | mimalloc | jemalloc |
 | --- | ---: | ---: | ---: | ---: |
 | `same_thread_small_churn/32` | **9.17 ns** | 63.01 ns | 10.41 ns | 9.27 ns |
-| `same_thread_small_churn/64` | 9.11 ns | 48.40 ns | **7.81 ns** | 9.26 ns |
+| `same_thread_small_churn/64` | **7.54 ns** | 48.19 ns | 7.78 ns | 9.34 ns |
 | `same_thread_small_churn/65` | **9.15 ns** | 47.85 ns | 10.71 ns | 9.38 ns |
 | `same_thread_small_churn/4096` | **9.33 ns** | 14.04 ns | 14.18 ns | 10.55 ns |
 | `same_thread_small_churn/70000` | **11.54 ns** | 17.73 ns | 557.19 ns | 112.05 ns |
@@ -34,7 +34,7 @@ Method summary:
 - Orthotope's same-thread results still align with the intended architecture: thread-local reuse, class-normalized slabs, and in-place header refresh on reuse.
 - `embedding_batch` improved because `6,144`-byte requests no longer normalize into the old `262,144`-byte class. They now stay in a dedicated `6 KiB` class whose default refill and local-limit thresholds keep the full eight-object burst local.
 - Relative framing for this capture:
-  - same-thread hot-path reuse: Orthotope was best on `32`, `65`, `4096`, and `70000`, while `mimalloc` narrowly led `64`
+  - same-thread hot-path reuse: Orthotope was best on `32`, `64`, `65`, `4096`, and `70000`
   - `mixed_size_churn`: Orthotope was about `2.07x` faster than `mimalloc` and `2.16x` faster than `jemalloc`
   - `large_path`: Orthotope was about `2.33x` faster than the system allocator, `6.67x` faster than `jemalloc`, and `8.83x` faster than `mimalloc`
   - `embedding_batch`: Orthotope was about `1.04x` faster than `mimalloc`

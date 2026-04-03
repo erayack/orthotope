@@ -16,6 +16,17 @@ const HEADER_MAGIC: u32 = 0x4f52_5448;
 const LARGE_CLASS_SENTINEL: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+struct AllocationHeaderPrefix {
+    magic: u32,
+    kind: AllocationKindTag,
+    class_index: u8,
+    reserved: [u8; 2],
+    requested_size: u32,
+    usable_size: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 /// Decoded allocation kind stored in the header.
 pub(crate) enum AllocationKind {
@@ -45,6 +56,8 @@ pub(crate) struct AllocationHeader {
 }
 
 impl AllocationHeader {
+    pub(crate) const PREFIX_SIZE: usize = size_of::<AllocationHeaderPrefix>();
+
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn new_small(class: SizeClass, requested_size: usize) -> Option<Self> {
@@ -157,6 +170,44 @@ impl AllocationHeader {
         Some(header_ptr)
     }
 
+    pub(crate) fn initialize_small_to_block(
+        block_start: NonNull<u8>,
+        class: SizeClass,
+    ) -> Option<NonNull<Self>> {
+        let class_index = size_class_to_index(class);
+        let usable_size = u32::try_from(class.payload_size()).ok()?;
+        let header_ptr = header_from_block_start(block_start);
+
+        debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+
+        // SAFETY: `header_ptr` names the 64-byte header region at the start of a valid
+        // allocator block, and these writes establish the invariant small-block metadata.
+        unsafe {
+            Self::write_small_prefix(header_ptr, class_index, 1, usable_size);
+            ptr::addr_of_mut!((*header_ptr.as_ptr()).padding).write([0; 48]);
+        }
+
+        Some(header_ptr)
+    }
+
+    pub(crate) fn refresh_small_requested_size(
+        block_start: NonNull<u8>,
+        requested_size: usize,
+    ) -> Option<NonNull<Self>> {
+        let requested_size = u32::try_from(requested_size).ok()?;
+        let header_ptr = header_from_block_start(block_start);
+
+        debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+
+        // SAFETY: `header_ptr` points to an initialized small-allocation header, so
+        // updating only the requested-size field preserves the routing metadata.
+        unsafe {
+            ptr::addr_of_mut!((*header_ptr.as_ptr()).requested_size).write(requested_size);
+        }
+
+        Some(header_ptr)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn write_large_to_block(
         block_start: NonNull<u8>,
@@ -219,6 +270,40 @@ impl AllocationHeader {
             ptr::addr_of_mut!((*header).usable_size).write(usable_size);
         }
     }
+
+    unsafe fn write_small_prefix(
+        header_ptr: NonNull<Self>,
+        class_index: u8,
+        requested_size: u32,
+        usable_size: u32,
+    ) {
+        // SAFETY: the caller guarantees `header_ptr` points at writable header storage for
+        // a valid small allocator block, so these field writes establish small-block metadata.
+        unsafe {
+            Self::write_encoded_fields(
+                header_ptr,
+                AllocationKindTag::Small,
+                class_index,
+                requested_size,
+                usable_size,
+            );
+        }
+    }
+
+    pub(crate) unsafe fn read_from_user_ptr(
+        user_ptr: NonNull<u8>,
+    ) -> Result<(Self, AllocationKind), FreeError> {
+        let header_ptr = header_from_user_ptr(user_ptr);
+        let header_prefix = header_prefix_from_user_ptr(user_ptr);
+        // SAFETY: the caller already established that `user_ptr` has a plausible header
+        // address and alignment; reading just the prefix is enough for routing validation.
+        let prefix = unsafe { header_prefix.as_ptr().read() };
+        let kind = validate_prefix(prefix)?;
+        // SAFETY: the same header address is valid for a full-header read once routing
+        // validation has confirmed a well-formed live header prefix.
+        let header = unsafe { header_ptr.as_ptr().read() };
+        Ok((header, kind))
+    }
 }
 
 fn encode_small_fields(class: SizeClass, requested_size: usize) -> Option<(u8, u32, u32)> {
@@ -244,9 +329,42 @@ fn encode_large_fields(requested_size: usize, usable_size: usize) -> Option<(u32
     ))
 }
 
+fn validate_prefix(prefix: AllocationHeaderPrefix) -> Result<AllocationKind, FreeError> {
+    if prefix.magic != HEADER_MAGIC {
+        return Err(FreeError::CorruptHeader);
+    }
+
+    if prefix.requested_size == 0 || prefix.usable_size < prefix.requested_size {
+        return Err(FreeError::CorruptHeader);
+    }
+
+    match prefix.kind {
+        AllocationKindTag::Small => {
+            let class = index_to_size_class(prefix.class_index).ok_or(FreeError::CorruptHeader)?;
+            if prefix.usable_size as usize != class.payload_size() {
+                return Err(FreeError::CorruptHeader);
+            }
+            Ok(AllocationKind::Small(class))
+        }
+        AllocationKindTag::Large => {
+            if prefix.class_index != LARGE_CLASS_SENTINEL {
+                return Err(FreeError::CorruptHeader);
+            }
+            Ok(AllocationKind::Large)
+        }
+    }
+}
+
 #[must_use]
 #[allow(dead_code)]
 pub(crate) const fn header_from_block_start(block_start: NonNull<u8>) -> NonNull<AllocationHeader> {
+    block_start.cast()
+}
+
+#[must_use]
+const fn header_prefix_from_block_start(
+    block_start: NonNull<u8>,
+) -> NonNull<AllocationHeaderPrefix> {
     block_start.cast()
 }
 
@@ -285,6 +403,11 @@ pub(crate) const fn header_from_user_ptr(user_ptr: NonNull<u8>) -> NonNull<Alloc
         .cast::<AllocationHeader>();
     // SAFETY: subtracting the header size from a valid user pointer yields the header address.
     unsafe { NonNull::new_unchecked(header_ptr) }
+}
+
+#[must_use]
+const fn header_prefix_from_user_ptr(user_ptr: NonNull<u8>) -> NonNull<AllocationHeaderPrefix> {
+    header_prefix_from_block_start(block_start_from_user_ptr(user_ptr))
 }
 
 #[must_use]
@@ -332,6 +455,7 @@ const fn index_to_size_class(index: u8) -> Option<SizeClass> {
 
 const _: [(); HEADER_SIZE] = [(); size_of::<AllocationHeader>()];
 const _: [(); HEADER_ALIGNMENT] = [(); align_of::<AllocationHeader>()];
+const _: [(); AllocationHeader::PREFIX_SIZE] = [(); size_of::<AllocationHeaderPrefix>()];
 
 #[cfg(test)]
 mod tests {

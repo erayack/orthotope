@@ -9,12 +9,12 @@ use crate::error::{AllocError, FreeError, InitError};
 use crate::free_list::Batch;
 use crate::header::{
     AllocationHeader, AllocationKind, HEADER_ALIGNMENT, HEADER_SIZE, block_start_from_user_ptr,
-    header_from_user_ptr, user_ptr_from_block_start,
+    user_ptr_from_block_start,
 };
 use crate::large_object::LargeObjectAllocator;
 use crate::size_class::SizeClass;
 use crate::stats::{AllocatorStats, SizeClassStats};
-use crate::thread_cache::ThreadCache;
+use crate::thread_cache::{BlockReuse, ThreadCache};
 
 static NEXT_ALLOCATOR_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -217,16 +217,27 @@ impl Allocator {
             }
         }
 
-        let block_start = cache.pop(class).ok_or_else(|| AllocError::OutOfMemory {
+        let (block_start, reuse) = cache.pop(class).ok_or_else(|| AllocError::OutOfMemory {
             requested: requested_size,
             remaining: self.arena.remaining(),
         })?;
 
-        let _ = AllocationHeader::write_small_to_block(block_start, class, requested_size)
-            .ok_or_else(|| AllocError::OutOfMemory {
-                requested: requested_size,
-                remaining: self.arena.remaining(),
-            })?;
+        match reuse {
+            BlockReuse::HeaderIntact => {
+                let _ = AllocationHeader::refresh_small_requested_size(block_start, requested_size)
+                    .ok_or_else(|| AllocError::OutOfMemory {
+                        requested: requested_size,
+                        remaining: self.arena.remaining(),
+                    })?;
+            }
+            BlockReuse::NeedsHeaderRewrite => {
+                let _ = AllocationHeader::write_small_to_block(block_start, class, requested_size)
+                    .ok_or_else(|| AllocError::OutOfMemory {
+                        requested: requested_size,
+                        remaining: self.arena.remaining(),
+                    })?;
+            }
+        }
 
         Ok(user_ptr_from_block_start(block_start))
     }
@@ -247,6 +258,7 @@ impl Allocator {
         };
 
         let carved = span.size() / block_size;
+        initialize_small_span_headers(span.start(), block_size, carved, class)?;
 
         cache.push_owned_slab(class, span.start(), block_size, carved);
 
@@ -374,13 +386,10 @@ impl Allocator {
             return Err(FreeError::CorruptHeader);
         }
 
-        let header_ptr = header_from_user_ptr(user_ptr);
         // SAFETY: the checked subtraction and alignment guard above ensure the derived
-        // header address is plausibly aligned for `AllocationHeader`; reading a copy
-        // lets validation inspect the stored metadata before any routing decision.
-        let header = unsafe { header_ptr.as_ptr().read() };
-        let kind = header.validate()?;
-        Ok((header, kind))
+        // header address is plausibly aligned for `AllocationHeader`; prefix validation
+        // inspects only the routing fields before copying the full header.
+        unsafe { AllocationHeader::read_from_user_ptr(user_ptr) }
     }
 
     fn reserve_refill_span(
@@ -406,6 +415,34 @@ impl Allocator {
                 other => other,
             })
     }
+}
+
+fn initialize_small_span_headers(
+    span_start: NonNull<u8>,
+    block_size: usize,
+    blocks: usize,
+    class: SizeClass,
+) -> Result<(), AllocError> {
+    for index in 0..blocks {
+        let offset = index
+            .checked_mul(block_size)
+            .ok_or(AllocError::OutOfMemory {
+                requested: block_size,
+                remaining: 0,
+            })?;
+        let block_start = span_start.as_ptr().wrapping_add(offset);
+        // SAFETY: `offset` walks a bounded set of block starts inside one reserved span.
+        let block_start = unsafe { NonNull::new_unchecked(block_start) };
+        let _ =
+            AllocationHeader::initialize_small_to_block(block_start, class).ok_or_else(|| {
+                AllocError::OutOfMemory {
+                    requested: class.payload_size(),
+                    remaining: 0,
+                }
+            })?;
+    }
+
+    Ok(())
 }
 
 const fn align_up_checked(value: usize, alignment: usize) -> Option<usize> {
