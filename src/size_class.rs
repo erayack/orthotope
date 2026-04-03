@@ -1,7 +1,7 @@
 use crate::header::HEADER_SIZE;
 
 /// Number of fixed small-request classes.
-pub const NUM_CLASSES: usize = 6;
+pub const NUM_CLASSES: usize = 12;
 /// Default block-start alignment used for class sizing.
 pub const BLOCK_ALIGNMENT: usize = 64;
 
@@ -14,7 +14,19 @@ pub enum SizeClass {
     B256,
     /// Requests in `257..=4096`.
     B4K,
-    /// Requests in `4097..=262_144`.
+    /// Requests in `4097..=6144`.
+    B6K,
+    /// Requests in `6145..=8192`.
+    B8K,
+    /// Requests in `8193..=16_384`.
+    B16K,
+    /// Requests in `16_385..=32_768`.
+    B32K,
+    /// Requests in `32_769..=65_536`.
+    B64K,
+    /// Requests in `65_537..=131_072`.
+    B128K,
+    /// Requests in `131_073..=262_144`.
     B256K,
     /// Requests in `262_145..=1_048_576`.
     B1M,
@@ -28,6 +40,12 @@ impl SizeClass {
         Self::B64,
         Self::B256,
         Self::B4K,
+        Self::B6K,
+        Self::B8K,
+        Self::B16K,
+        Self::B32K,
+        Self::B64K,
+        Self::B128K,
         Self::B256K,
         Self::B1M,
         Self::B16M,
@@ -40,7 +58,13 @@ impl SizeClass {
             1..=64 => Some(Self::B64),
             65..=256 => Some(Self::B256),
             257..=4096 => Some(Self::B4K),
-            4097..=262_144 => Some(Self::B256K),
+            4097..=6144 => Some(Self::B6K),
+            6145..=8192 => Some(Self::B8K),
+            8193..=16_384 => Some(Self::B16K),
+            16_385..=32_768 => Some(Self::B32K),
+            32_769..=65_536 => Some(Self::B64K),
+            65_537..=131_072 => Some(Self::B128K),
+            131_073..=262_144 => Some(Self::B256K),
             262_145..=1_048_576 => Some(Self::B1M),
             1_048_577..=16_777_216 => Some(Self::B16M),
             _ => None,
@@ -54,6 +78,12 @@ impl SizeClass {
             Self::B64 => 64,
             Self::B256 => 256,
             Self::B4K => 4_096,
+            Self::B6K => 6 * 1_024,
+            Self::B8K => 8_192,
+            Self::B16K => 16_384,
+            Self::B32K => 32_768,
+            Self::B64K => 65_536,
+            Self::B128K => 131_072,
             Self::B256K => 262_144,
             Self::B1M => 1_048_576,
             Self::B16M => 16_777_216,
@@ -88,9 +118,15 @@ impl SizeClass {
             Self::B64 => 0,
             Self::B256 => 1,
             Self::B4K => 2,
-            Self::B256K => 3,
-            Self::B1M => 4,
-            Self::B16M => 5,
+            Self::B6K => 3,
+            Self::B8K => 4,
+            Self::B16K => 5,
+            Self::B32K => 6,
+            Self::B64K => 7,
+            Self::B128K => 8,
+            Self::B256K => 9,
+            Self::B1M => 10,
+            Self::B16M => 11,
         }
     }
 

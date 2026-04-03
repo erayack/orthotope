@@ -102,3 +102,45 @@ fn large_reuse_stats_track_bucketed_free_blocks_correctly() {
             .unwrap_or_else(|error| panic!("expected reused large free to succeed: {error}"));
     }
 }
+
+#[test]
+fn embedding_batch_sized_bursts_stay_local_with_default_medium_class() {
+    let config = AllocatorConfig::default();
+    let allocator = Allocator::new(config)
+        .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+    let mut cache = ThreadCache::new(config);
+    let class = SizeClass::from_request(6_144)
+        .unwrap_or_else(|| panic!("expected embedding-sized request to use the small path"));
+    let mut pointers = Vec::with_capacity(8);
+
+    assert_eq!(class, SizeClass::B6K);
+    assert_eq!(config.refill_count(class), 5);
+    assert_eq!(config.local_limit(class), 10);
+    assert_eq!(config.drain_count(class), 2);
+
+    for _ in 0..8 {
+        let ptr = allocator
+            .allocate_with_cache(&mut cache, 6_144)
+            .unwrap_or_else(|error| {
+                panic!("expected embedding-sized allocation to succeed: {error}")
+            });
+        pointers.push(ptr);
+    }
+
+    while let Some(ptr) = pointers.pop() {
+        // SAFETY: every pointer in `pointers` is live and is freed exactly once here.
+        unsafe {
+            allocator
+                .deallocate_with_size_checked(&mut cache, ptr, 6_144)
+                .unwrap_or_else(|error| {
+                    panic!("expected embedding-sized free to succeed: {error}")
+                });
+        }
+    }
+
+    let local = cache.stats();
+    let shared = allocator.stats();
+
+    assert!(local.local[class.index()].blocks >= 8);
+    assert_eq!(shared.small_central[class.index()].blocks, 0);
+}

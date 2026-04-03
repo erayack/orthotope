@@ -11,7 +11,19 @@ fn request_boundaries_map_to_expected_classes() {
     assert_eq!(SizeClass::from_request(256), Some(SizeClass::B256));
     assert_eq!(SizeClass::from_request(257), Some(SizeClass::B4K));
     assert_eq!(SizeClass::from_request(4_096), Some(SizeClass::B4K));
-    assert_eq!(SizeClass::from_request(4_097), Some(SizeClass::B256K));
+    assert_eq!(SizeClass::from_request(4_097), Some(SizeClass::B6K));
+    assert_eq!(SizeClass::from_request(6_144), Some(SizeClass::B6K));
+    assert_eq!(SizeClass::from_request(6_145), Some(SizeClass::B8K));
+    assert_eq!(SizeClass::from_request(8_192), Some(SizeClass::B8K));
+    assert_eq!(SizeClass::from_request(8_193), Some(SizeClass::B16K));
+    assert_eq!(SizeClass::from_request(16_384), Some(SizeClass::B16K));
+    assert_eq!(SizeClass::from_request(16_385), Some(SizeClass::B32K));
+    assert_eq!(SizeClass::from_request(32_768), Some(SizeClass::B32K));
+    assert_eq!(SizeClass::from_request(32_769), Some(SizeClass::B64K));
+    assert_eq!(SizeClass::from_request(65_536), Some(SizeClass::B64K));
+    assert_eq!(SizeClass::from_request(65_537), Some(SizeClass::B128K));
+    assert_eq!(SizeClass::from_request(131_072), Some(SizeClass::B128K));
+    assert_eq!(SizeClass::from_request(131_073), Some(SizeClass::B256K));
     assert_eq!(SizeClass::from_request(262_144), Some(SizeClass::B256K));
     assert_eq!(SizeClass::from_request(262_145), Some(SizeClass::B1M));
     assert_eq!(SizeClass::from_request(1_048_576), Some(SizeClass::B1M));
@@ -103,6 +115,10 @@ fn config_derives_refill_and_drain_counts_per_class() {
     assert_eq!(config.refill_count(SizeClass::B64), 256);
     assert_eq!(config.local_limit(SizeClass::B64), 512);
     assert_eq!(config.drain_count(SizeClass::B64), 128);
+
+    assert_eq!(config.refill_count(SizeClass::B6K), 5);
+    assert_eq!(config.local_limit(SizeClass::B6K), 10);
+    assert_eq!(config.drain_count(SizeClass::B6K), 2);
 
     assert_eq!(config.refill_count(SizeClass::B16M), 1);
     assert_eq!(config.local_limit(SizeClass::B16M), 2);

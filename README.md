@@ -84,7 +84,13 @@ Small-request classes:
 - `1..=64`
 - `65..=256`
 - `257..=4096`
-- `4097..=262_144`
+- `4097..=6144`
+- `6145..=8192`
+- `8193..=16_384`
+- `16_385..=32_768`
+- `32_769..=65_536`
+- `65_537..=131_072`
+- `131_073..=262_144`
 - `262_145..=1_048_576`
 - `1_048_577..=16_777_216`
 
@@ -97,7 +103,7 @@ isolated benchmark worktree rather than this main checkout.
 
 In the current local run, Orthotope was:
 
-- about `1.8x` to `7.1x` faster than the system allocator on same-thread hot-path reuse workloads
-- about `2.2x` faster than `jemalloc` and `mimalloc` on `mixed_size_churn`
-- about `2.8x` faster than the system allocator and about `7.4x` to `11x` faster than `jemalloc` and `mimalloc` on `large_path`
-- about `1.1x` faster than the system allocator and `jemalloc` on `long_lived_handoff`
+- fastest on `embedding_batch`, `mixed_size_churn`, and `large_path` in this local capture
+- fastest on four of the five same-thread hot-path reuse sizes, with `mimalloc` narrowly leading only `64`
+- about `2.1x` faster than `mimalloc` and `2.2x` faster than `jemalloc` on `mixed_size_churn`
+- about `2.3x` faster than the system allocator and about `6.7x` to `8.8x` faster than `jemalloc` and `mimalloc` on `large_path`

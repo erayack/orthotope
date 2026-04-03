@@ -299,9 +299,15 @@ const fn size_class_to_index(class: SizeClass) -> u8 {
         SizeClass::B64 => 0,
         SizeClass::B256 => 1,
         SizeClass::B4K => 2,
-        SizeClass::B256K => 3,
-        SizeClass::B1M => 4,
-        SizeClass::B16M => 5,
+        SizeClass::B6K => 3,
+        SizeClass::B8K => 4,
+        SizeClass::B16K => 5,
+        SizeClass::B32K => 6,
+        SizeClass::B64K => 7,
+        SizeClass::B128K => 8,
+        SizeClass::B256K => 9,
+        SizeClass::B1M => 10,
+        SizeClass::B16M => 11,
     }
 }
 
@@ -311,9 +317,15 @@ const fn index_to_size_class(index: u8) -> Option<SizeClass> {
         0 => Some(SizeClass::B64),
         1 => Some(SizeClass::B256),
         2 => Some(SizeClass::B4K),
-        3 => Some(SizeClass::B256K),
-        4 => Some(SizeClass::B1M),
-        5 => Some(SizeClass::B16M),
+        3 => Some(SizeClass::B6K),
+        4 => Some(SizeClass::B8K),
+        5 => Some(SizeClass::B16K),
+        6 => Some(SizeClass::B32K),
+        7 => Some(SizeClass::B64K),
+        8 => Some(SizeClass::B128K),
+        9 => Some(SizeClass::B256K),
+        10 => Some(SizeClass::B1M),
+        11 => Some(SizeClass::B16M),
         _ => None,
     }
 }
