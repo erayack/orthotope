@@ -118,6 +118,65 @@ impl Arena {
         }
     }
 
+    /// Reserves up to `target_blocks` contiguous `block_size` blocks from the arena.
+    ///
+    /// Returns `Ok(None)` when fewer than one block currently fits.
+    pub(crate) fn reserve_block_span(
+        &self,
+        block_size: usize,
+        target_blocks: usize,
+    ) -> Result<Option<ReservedSpan>, AllocError> {
+        if block_size == 0 || target_blocks == 0 {
+            return Err(AllocError::ZeroSize);
+        }
+
+        loop {
+            let current = self.next.load(Ordering::Relaxed);
+            let aligned =
+                align_up(current, self.alignment).ok_or_else(|| AllocError::OutOfMemory {
+                    requested: block_size,
+                    remaining: self.len.saturating_sub(current),
+                })?;
+            let remaining = self.len.saturating_sub(aligned);
+            let available_blocks = remaining / block_size;
+            let reserved_blocks = core::cmp::min(target_blocks, available_blocks);
+
+            if reserved_blocks == 0 {
+                return Ok(None);
+            }
+
+            let size = reserved_blocks
+                .checked_mul(block_size)
+                .ok_or(AllocError::OutOfMemory {
+                    requested: block_size,
+                    remaining,
+                })?;
+            let end = aligned.checked_add(size).ok_or(AllocError::OutOfMemory {
+                requested: size,
+                remaining,
+            })?;
+
+            if end > self.len {
+                return Err(AllocError::OutOfMemory {
+                    requested: size,
+                    remaining,
+                });
+            }
+
+            if self
+                .next
+                .compare_exchange_weak(current, end, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                let ptr = self.base.as_ptr().wrapping_add(aligned);
+                // SAFETY: `aligned < self.len` and `end <= self.len` keep the start inside
+                // the mapped arena, and `base` is non-null for the arena lifetime.
+                let start = unsafe { NonNull::new_unchecked(ptr) };
+                return Ok(Some(ReservedSpan { start, size }));
+            }
+        }
+    }
+
     #[must_use]
     /// Returns the remaining unreserved capacity in bytes.
     pub fn remaining(&self) -> usize {

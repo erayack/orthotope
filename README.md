@@ -55,12 +55,15 @@ rehoming cached blocks.
 - each thread cache owns class-local slabs carved from contiguous arena spans
 - small-cache arena refill reserves one contiguous span, registers it as a local slab, and splits it into class-sized blocks
 - frees are routed by a 64-byte allocation header
+- small-allocation headers are refreshed in place on reuse instead of rebuilding a fresh header object
 - requests above `16 MiB` use the large-allocation path
 - default alignment is `64` bytes
 - custom allocator alignment must be a power of two and at least `64` bytes
 - the global convenience API uses `AllocatorConfig::default()`
 - freed large allocations return to an arena-backed reusable pool for later
-  same-size or smaller large requests
+  same-size or smaller large requests, using smallest-fitting reuse first
+- rebinding an empty caller-owned `ThreadCache` to another allocator clears stale
+  local slab metadata before the new allocator starts carving fresh slabs
 
 Small-object provenance in v1 is limited to header validation plus an arena-range
 ownership check on the decoded block start. Foreign pointers are rejected where

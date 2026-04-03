@@ -9,6 +9,15 @@ const fn draining_config() -> AllocatorConfig {
     }
 }
 
+const fn large_stats_config() -> AllocatorConfig {
+    AllocatorConfig {
+        arena_size: 64 << 20,
+        alignment: 64,
+        refill_target_bytes: 512,
+        local_cache_target_bytes: 256,
+    }
+}
+
 #[test]
 fn freeing_into_a_slab_backed_cache_drains_a_full_batch_when_over_limit() {
     let config = draining_config();
@@ -44,4 +53,52 @@ fn freeing_into_a_slab_backed_cache_drains_a_full_batch_when_over_limit() {
         config.drain_count(class),
         "the central pool should receive a full configured drain batch"
     );
+}
+
+#[test]
+fn large_reuse_stats_track_bucketed_free_blocks_correctly() {
+    let config = large_stats_config();
+    let allocator = Allocator::new(config)
+        .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+    let mut cache = ThreadCache::new(config);
+    let first_request = SizeClass::max_small_request() + 1;
+    let second_request = first_request + 1_024;
+
+    let first = allocator
+        .allocate_with_cache(&mut cache, first_request)
+        .unwrap_or_else(|error| panic!("expected first large allocation to succeed: {error}"));
+    let second = allocator
+        .allocate_with_cache(&mut cache, second_request)
+        .unwrap_or_else(|error| panic!("expected second large allocation to succeed: {error}"));
+
+    // SAFETY: both pointers are still live large allocations returned by this allocator.
+    unsafe {
+        allocator
+            .deallocate_with_size_checked(&mut cache, first, first_request)
+            .unwrap_or_else(|error| panic!("expected first large free to succeed: {error}"));
+        allocator
+            .deallocate_with_size_checked(&mut cache, second, second_request)
+            .unwrap_or_else(|error| panic!("expected second large free to succeed: {error}"));
+    }
+
+    let freed = allocator.stats();
+    assert_eq!(freed.large_live_allocations, 0);
+    assert_eq!(freed.large_free_blocks, 2);
+    assert!(freed.large_free_bytes > 0);
+
+    let reused = allocator
+        .allocate_with_cache(&mut cache, first_request)
+        .unwrap_or_else(|error| panic!("expected large reuse allocation to succeed: {error}"));
+
+    let after_reuse = allocator.stats();
+    assert_eq!(after_reuse.large_live_allocations, 1);
+    assert_eq!(after_reuse.large_free_blocks, 1);
+    assert!(after_reuse.large_free_bytes < freed.large_free_bytes);
+
+    // SAFETY: `reused` is the currently live large allocation returned above.
+    unsafe {
+        allocator
+            .deallocate_with_size_checked(&mut cache, reused, first_request)
+            .unwrap_or_else(|error| panic!("expected reused large free to succeed: {error}"));
+    }
 }

@@ -21,6 +21,7 @@ pub struct ThreadCache {
 struct LocalClassCache {
     slabs: Vec<LocalSlab>,
     available_slabs: Vec<usize>,
+    recent_slab: Option<usize>,
     shared: FreeList,
     shared_len: usize,
     total_len: usize,
@@ -60,6 +61,7 @@ impl ThreadCache {
             "thread cache cannot be reused across allocators while it still holds cached blocks"
         );
 
+        self.reset_for_rebind();
         self.config = *allocator.config();
         self.owner = Some(owner);
     }
@@ -199,6 +201,10 @@ impl ThreadCache {
             local,
         }
     }
+
+    fn reset_for_rebind(&mut self) {
+        self.classes = core::array::from_fn(|_| LocalClassCache::new());
+    }
 }
 
 impl LocalClassCache {
@@ -206,6 +212,7 @@ impl LocalClassCache {
         Self {
             slabs: Vec::new(),
             available_slabs: Vec::new(),
+            recent_slab: None,
             shared: FreeList::new(),
             shared_len: 0,
             total_len: 0,
@@ -224,6 +231,7 @@ impl LocalClassCache {
         let index = self.slabs.len();
         self.slabs.push(LocalSlab::new(start, block_size, capacity));
         self.available_slabs.push(index);
+        self.recent_slab = Some(index);
         self.total_len = self
             .total_len
             .checked_add(capacity)
@@ -235,6 +243,7 @@ impl LocalClassCache {
             let slab = &mut self.slabs[index];
             // SAFETY: the slab owns its free storage exclusively while borrowed mutably here.
             if let Some(block) = unsafe { slab.pop_block() } {
+                self.recent_slab = Some(index);
                 self.total_len -= 1;
                 if !slab.has_available_blocks() {
                     let _ = self.available_slabs.pop();
@@ -255,7 +264,23 @@ impl LocalClassCache {
     }
 
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
+        if let Some(index) = self
+            .recent_slab
+            .filter(|&index| self.slabs[index].contains(block))
+        {
+            let slab = &mut self.slabs[index];
+            let was_empty = !slab.has_available_blocks();
+            // SAFETY: the caller guarantees `block` is detached and valid for this class.
+            unsafe { slab.push_block(block) };
+            if was_empty {
+                self.available_slabs.push(index);
+            }
+            self.total_len += 1;
+            return;
+        }
+
         if let Some(index) = self.find_slab(block) {
+            self.recent_slab = Some(index);
             let slab = &mut self.slabs[index];
             let was_empty = !slab.has_available_blocks();
             // SAFETY: the caller guarantees `block` is detached and valid for this class.
@@ -750,5 +775,47 @@ mod tests {
             2 * SizeClass::B64.block_size_for_alignment(test_config().alignment)
                 + SizeClass::B256.block_size_for_alignment(test_config().alignment)
         );
+    }
+
+    #[test]
+    fn rebinding_an_empty_cache_discards_stale_slab_metadata() {
+        let allocator_a = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator A to initialize: {error}"));
+        let allocator_b = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator B to initialize: {error}"));
+        let mut cache = ThreadCache::new(test_config());
+        let class = SizeClass::B64;
+
+        let first = allocator_a
+            .allocate_with_cache(&mut cache, 32)
+            .unwrap_or_else(|error| panic!("expected first allocator A allocation: {error}"));
+        let second = allocator_a
+            .allocate_with_cache(&mut cache, 32)
+            .unwrap_or_else(|error| panic!("expected second allocator A allocation: {error}"));
+
+        assert_eq!(cache.classes[class.index()].slabs.len(), 1);
+        assert!(cache.needs_refill(class));
+
+        let _ = allocator_b
+            .allocate_with_cache(&mut cache, 32)
+            .unwrap_or_else(|error| panic!("expected allocator B allocation to rebind: {error}"));
+
+        assert_eq!(
+            cache.classes[class.index()].slabs.len(),
+            1,
+            "rebinding an empty cache should discard slab metadata from the previous allocator"
+        );
+
+        // SAFETY: both pointers are still live allocations from allocator A and are freed once.
+        unsafe {
+            allocator_a
+                .deallocate_with_cache(&mut ThreadCache::new(test_config()), first)
+                .unwrap_or_else(|error| panic!("expected first allocator A cleanup free: {error}"));
+            allocator_a
+                .deallocate_with_cache(&mut ThreadCache::new(test_config()), second)
+                .unwrap_or_else(|error| {
+                    panic!("expected second allocator A cleanup free: {error}")
+                });
+        }
     }
 }

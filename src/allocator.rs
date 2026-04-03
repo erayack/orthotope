@@ -222,13 +222,11 @@ impl Allocator {
             remaining: self.arena.remaining(),
         })?;
 
-        let header = AllocationHeader::new_small(class, requested_size).ok_or_else(|| {
-            AllocError::OutOfMemory {
+        let _ = AllocationHeader::write_small_to_block(block_start, class, requested_size)
+            .ok_or_else(|| AllocError::OutOfMemory {
                 requested: requested_size,
                 remaining: self.arena.remaining(),
-            }
-        })?;
-        let _ = header.write_to_block(block_start);
+            })?;
 
         Ok(user_ptr_from_block_start(block_start))
     }
@@ -292,13 +290,11 @@ impl Allocator {
                 },
                 |block| Ok((block.block_start(), block.block_size, block.usable_size())),
             )?;
-        let header = AllocationHeader::new_large(requested_size, usable_size).ok_or_else(|| {
-            AllocError::OutOfMemory {
+        let _ = AllocationHeader::write_large_to_block(block_start, requested_size, usable_size)
+            .ok_or_else(|| AllocError::OutOfMemory {
                 requested: requested_size,
                 remaining: self.arena.remaining(),
-            }
-        })?;
-        let _ = header.write_to_block(block_start);
+            })?;
 
         let user_ptr = user_ptr_from_block_start(block_start);
         self.large.record_live_allocation(
@@ -393,44 +389,22 @@ impl Allocator {
         refill_count: usize,
         requested_size: usize,
     ) -> Result<Option<crate::arena::ReservedSpan>, AllocError> {
-        let requested_span_size =
-            block_size
-                .checked_mul(refill_count)
-                .ok_or_else(|| AllocError::OutOfMemory {
+        let _ = block_size
+            .checked_mul(refill_count)
+            .ok_or_else(|| AllocError::OutOfMemory {
+                requested: requested_size,
+                remaining: self.arena.remaining(),
+            })?;
+
+        self.arena
+            .reserve_block_span(block_size, refill_count)
+            .map_err(|error| match error {
+                AllocError::OutOfMemory { remaining, .. } => AllocError::OutOfMemory {
                     requested: requested_size,
-                    remaining: self.arena.remaining(),
-                })?;
-
-        match self.arena.reserve_span(requested_span_size) {
-            Ok(span) => Ok(Some(span)),
-            Err(AllocError::OutOfMemory { remaining, .. }) => {
-                let mut reduced_count = remaining / block_size;
-
-                while reduced_count > 0 {
-                    let reduced_span_size =
-                        block_size
-                            .checked_mul(reduced_count)
-                            .ok_or(AllocError::OutOfMemory {
-                                requested: requested_size,
-                                remaining,
-                            })?;
-                    match self.arena.reserve_span(reduced_span_size) {
-                        Ok(span) => return Ok(Some(span)),
-                        Err(AllocError::OutOfMemory { .. }) => {
-                            reduced_count -= 1;
-                        }
-                        Err(AllocError::GlobalInitFailed) => {
-                            return Err(AllocError::GlobalInitFailed);
-                        }
-                        Err(AllocError::ZeroSize) => return Err(AllocError::ZeroSize),
-                    }
-                }
-
-                Ok(None)
-            }
-            Err(AllocError::GlobalInitFailed) => Err(AllocError::GlobalInitFailed),
-            Err(AllocError::ZeroSize) => Err(AllocError::ZeroSize),
-        }
+                    remaining,
+                },
+                other => other,
+            })
     }
 }
 

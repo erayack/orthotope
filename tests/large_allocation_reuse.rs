@@ -115,3 +115,49 @@ fn reusing_a_larger_freed_block_preserves_its_full_future_reuse_capacity() {
         Err(error) => panic!("unexpected allocation error after medium reuse: {error}"),
     }
 }
+
+#[test]
+fn large_reuse_prefers_smallest_fitting_freed_block() {
+    let medium_request = 18_000_000;
+    let large_request = 20_000_000;
+    let target_request = 17_500_000;
+    let arena_size = align_up(medium_request + orthotope::header::HEADER_SIZE, 64)
+        + align_up(large_request + orthotope::header::HEADER_SIZE, 64);
+
+    let allocator = match Allocator::new(AllocatorConfig {
+        arena_size,
+        alignment: 64,
+        refill_target_bytes: 128,
+        local_cache_target_bytes: 256,
+    }) {
+        Ok(allocator) => allocator,
+        Err(error) => panic!("expected allocator to initialize: {error}"),
+    };
+    let mut cache = ThreadCache::new(*allocator.config());
+
+    let medium = allocator
+        .allocate_with_cache(&mut cache, medium_request)
+        .unwrap_or_else(|error| panic!("expected medium large allocation to succeed: {error}"));
+    let large = allocator
+        .allocate_with_cache(&mut cache, large_request)
+        .unwrap_or_else(|error| panic!("expected larger allocation to succeed: {error}"));
+
+    // SAFETY: both pointers are still live large allocations returned by this allocator.
+    unsafe {
+        allocator
+            .deallocate_with_size_checked(&mut cache, large, large_request)
+            .unwrap_or_else(|error| panic!("expected larger free to succeed: {error}"));
+        allocator
+            .deallocate_with_size_checked(&mut cache, medium, medium_request)
+            .unwrap_or_else(|error| panic!("expected medium free to succeed: {error}"));
+    }
+
+    let reused = allocator
+        .allocate_with_cache(&mut cache, target_request)
+        .unwrap_or_else(|error| panic!("expected target request to reuse a freed block: {error}"));
+
+    assert_eq!(
+        reused, medium,
+        "large reuse should pick the smallest fitting freed block first"
+    );
+}

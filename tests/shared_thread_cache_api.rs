@@ -56,8 +56,23 @@ fn empty_shared_thread_cache_can_rebind_to_another_allocator() {
             panic!("expected allocator B allocation to succeed with an empty cache: {error}")
         }
     };
+    let second = match allocator_b.allocate_with_cache(&mut cache, 32) {
+        Ok(ptr) => ptr,
+        Err(error) => {
+            panic!("expected allocator B to keep allocating cleanly after rebinding: {error}")
+        }
+    };
+
+    assert_ne!(
+        ptr, second,
+        "rebinding an empty cache should not retain stale slab metadata from allocator A"
+    );
 
     // SAFETY: `ptr` was returned by allocator B just above.
     let result = unsafe { allocator_b.deallocate_with_cache(&mut cache, ptr) };
     assert_eq!(result, Ok(()));
+
+    // SAFETY: `second` is the other live allocation returned by allocator B above.
+    let second_result = unsafe { allocator_b.deallocate_with_cache(&mut cache, second) };
+    assert_eq!(second_result, Ok(()));
 }

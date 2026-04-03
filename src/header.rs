@@ -2,6 +2,7 @@
 
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
+use core::ptr::{self};
 
 use crate::error::FreeError;
 use crate::size_class::SizeClass;
@@ -47,41 +48,26 @@ impl AllocationHeader {
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn new_small(class: SizeClass, requested_size: usize) -> Option<Self> {
-        if requested_size == 0 || requested_size > class.payload_size() {
-            return None;
-        }
-        let requested_size = u32::try_from(requested_size).ok()?;
-        let usable_size = u32::try_from(class.payload_size()).ok()?;
-
-        Some(Self {
-            magic: HEADER_MAGIC,
-            kind: AllocationKindTag::Small,
-            class_index: size_class_to_index(class),
-            reserved: [0; 2],
+        let (class_index, requested_size, usable_size) =
+            encode_small_fields(class, requested_size)?;
+        Some(Self::from_encoded_fields(
+            AllocationKindTag::Small,
+            class_index,
             requested_size,
             usable_size,
-            padding: [0; 48],
-        })
+        ))
     }
 
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn new_large(requested_size: usize, usable_size: usize) -> Option<Self> {
-        if requested_size == 0 || usable_size < requested_size {
-            return None;
-        }
-        let requested_size = u32::try_from(requested_size).ok()?;
-        let usable_size = u32::try_from(usable_size).ok()?;
-
-        Some(Self {
-            magic: HEADER_MAGIC,
-            kind: AllocationKindTag::Large,
-            class_index: LARGE_CLASS_SENTINEL,
-            reserved: [0; 2],
+        let (requested_size, usable_size) = encode_large_fields(requested_size, usable_size)?;
+        Some(Self::from_encoded_fields(
+            AllocationKindTag::Large,
+            LARGE_CLASS_SENTINEL,
             requested_size,
             usable_size,
-            padding: [0; 48],
-        })
+        ))
     }
 
     /// Validates the stored header bytes and decodes the allocation routing kind.
@@ -143,6 +129,119 @@ impl AllocationHeader {
         }
         header_ptr
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_small_to_block(
+        block_start: NonNull<u8>,
+        class: SizeClass,
+        requested_size: usize,
+    ) -> Option<NonNull<Self>> {
+        let (class_index, requested_size, usable_size) =
+            encode_small_fields(class, requested_size)?;
+        let header_ptr = header_from_block_start(block_start);
+
+        debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+
+        // SAFETY: `header_ptr` names the 64-byte header region at the start of a valid
+        // allocator block, and writing these fields refreshes metadata in place.
+        unsafe {
+            Self::write_encoded_fields(
+                header_ptr,
+                AllocationKindTag::Small,
+                class_index,
+                requested_size,
+                usable_size,
+            );
+        }
+
+        Some(header_ptr)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn write_large_to_block(
+        block_start: NonNull<u8>,
+        requested_size: usize,
+        usable_size: usize,
+    ) -> Option<NonNull<Self>> {
+        let (requested_size, usable_size) = encode_large_fields(requested_size, usable_size)?;
+        let header_ptr = header_from_block_start(block_start);
+
+        debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+
+        // SAFETY: `header_ptr` names the 64-byte header region at the start of a valid
+        // allocator block, and writing these fields refreshes metadata in place.
+        unsafe {
+            Self::write_encoded_fields(
+                header_ptr,
+                AllocationKindTag::Large,
+                LARGE_CLASS_SENTINEL,
+                requested_size,
+                usable_size,
+            );
+        }
+
+        Some(header_ptr)
+    }
+
+    const fn from_encoded_fields(
+        kind: AllocationKindTag,
+        class_index: u8,
+        requested_size: u32,
+        usable_size: u32,
+    ) -> Self {
+        Self {
+            magic: HEADER_MAGIC,
+            kind,
+            class_index,
+            reserved: [0; 2],
+            requested_size,
+            usable_size,
+            padding: [0; 48],
+        }
+    }
+
+    unsafe fn write_encoded_fields(
+        header_ptr: NonNull<Self>,
+        kind: AllocationKindTag,
+        class_index: u8,
+        requested_size: u32,
+        usable_size: u32,
+    ) {
+        let header = header_ptr.as_ptr();
+        // SAFETY: the caller guarantees `header_ptr` points at writable header storage for
+        // a valid allocator block, so these field writes update that header in place.
+        unsafe {
+            ptr::addr_of_mut!((*header).magic).write(HEADER_MAGIC);
+            ptr::addr_of_mut!((*header).kind).write(kind);
+            ptr::addr_of_mut!((*header).class_index).write(class_index);
+            ptr::addr_of_mut!((*header).reserved).write([0; 2]);
+            ptr::addr_of_mut!((*header).requested_size).write(requested_size);
+            ptr::addr_of_mut!((*header).usable_size).write(usable_size);
+        }
+    }
+}
+
+fn encode_small_fields(class: SizeClass, requested_size: usize) -> Option<(u8, u32, u32)> {
+    if requested_size == 0 || requested_size > class.payload_size() {
+        return None;
+    }
+
+    Some((
+        size_class_to_index(class),
+        u32::try_from(requested_size).ok()?,
+        u32::try_from(class.payload_size()).ok()?,
+    ))
+}
+
+fn encode_large_fields(requested_size: usize, usable_size: usize) -> Option<(u32, u32)> {
+    if requested_size == 0 || usable_size < requested_size {
+        return None;
+    }
+
+    Some((
+        u32::try_from(requested_size).ok()?,
+        u32::try_from(usable_size).ok()?,
+    ))
 }
 
 #[must_use]
@@ -258,6 +357,40 @@ mod tests {
     fn allocation_header_stays_64_bytes_and_64_aligned() {
         assert_eq!(size_of::<AllocationHeader>(), HEADER_SIZE);
         assert_eq!(align_of::<AllocationHeader>(), HEADER_ALIGNMENT);
+    }
+
+    #[test]
+    fn specialized_small_writer_refreshes_requested_size() {
+        let mut storage = MaybeUninit::<TestBlock>::uninit();
+        let block_start = test_block_start(&mut storage);
+
+        AllocationHeader::write_small_to_block(block_start, SizeClass::B64, 1)
+            .unwrap_or_else(|| panic!("expected specialized small writer to succeed"));
+        AllocationHeader::write_small_to_block(block_start, SizeClass::B64, 64)
+            .unwrap_or_else(|| panic!("expected specialized small rewrite to succeed"));
+
+        // SAFETY: `block_start` points at the test block's valid header storage.
+        let header = unsafe { header_from_block_start(block_start).as_ref() };
+        assert_eq!(header.validate(), Ok(AllocationKind::Small(SizeClass::B64)));
+        assert_eq!(header.requested_size(), 64);
+        assert_eq!(header.usable_size(), 64);
+    }
+
+    #[test]
+    fn specialized_large_writer_refreshes_sizes() {
+        let mut storage = MaybeUninit::<TestBlock>::uninit();
+        let block_start = test_block_start(&mut storage);
+
+        AllocationHeader::write_large_to_block(block_start, 128, 192)
+            .unwrap_or_else(|| panic!("expected specialized large writer to succeed"));
+        AllocationHeader::write_large_to_block(block_start, 96, 192)
+            .unwrap_or_else(|| panic!("expected specialized large rewrite to succeed"));
+
+        // SAFETY: `block_start` points at the test block's valid header storage.
+        let header = unsafe { header_from_block_start(block_start).as_ref() };
+        assert_eq!(header.validate(), Ok(AllocationKind::Large));
+        assert_eq!(header.requested_size(), 96);
+        assert_eq!(header.usable_size(), 192);
     }
 
     #[test]

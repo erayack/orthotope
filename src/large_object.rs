@@ -1,4 +1,5 @@
 use core::ptr::NonNull;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
@@ -45,7 +46,38 @@ impl FreeLargeBlock {
 #[derive(Default)]
 struct LargeObjectState {
     live: HashMap<usize, LargeAllocationRecord>,
-    free: Vec<FreeLargeBlock>,
+    free: BTreeMap<usize, Vec<FreeLargeBlock>>,
+    free_blocks: usize,
+    free_bytes: usize,
+}
+
+impl LargeObjectState {
+    fn insert_free_block(&mut self, block: FreeLargeBlock) {
+        self.free.entry(block.block_size).or_default().push(block);
+        self.free_blocks += 1;
+        self.free_bytes += block.block_size;
+    }
+
+    fn take_best_fit_block(&mut self, minimum_block_size: usize) -> Option<FreeLargeBlock> {
+        let (&bucket_size, _) = self.free.range(minimum_block_size..).next()?;
+        let mut blocks = self
+            .free
+            .remove(&bucket_size)
+            .unwrap_or_else(|| unreachable!("selected reusable large-block bucket must exist"));
+        let block = blocks.pop().unwrap_or_else(|| {
+            unreachable!("selected reusable large-block bucket must be non-empty")
+        });
+        if !blocks.is_empty() {
+            let replaced = self.free.insert(bucket_size, blocks);
+            debug_assert!(
+                replaced.is_none(),
+                "large-object free bucket should not be reinserted twice"
+            );
+        }
+        self.free_blocks -= 1;
+        self.free_bytes -= block.block_size;
+        Some(block)
+    }
 }
 
 /// Tracks live allocations larger than the largest small class.
@@ -65,15 +97,9 @@ impl LargeObjectAllocator {
     #[must_use]
     pub(crate) fn take_reusable_block(&self, minimum_block_size: usize) -> Option<FreeLargeBlock> {
         let mut state = self.state.lock();
-        let best_fit_index = state
-            .free
-            .iter()
-            .enumerate()
-            .filter(|(_, block)| block.block_size >= minimum_block_size)
-            .min_by_key(|(_, block)| block.block_size)
-            .map(|(index, _)| index)?;
-
-        Some(state.free.swap_remove(best_fit_index))
+        let block = state.take_best_fit_block(minimum_block_size)?;
+        drop(state);
+        Some(block)
     }
 
     #[must_use]
@@ -82,8 +108,8 @@ impl LargeObjectAllocator {
         LargeObjectStats {
             live_allocations: state.live.len(),
             live_bytes: state.live.values().map(|record| record.block_size).sum(),
-            free_blocks: state.free.len(),
-            free_bytes: state.free.iter().map(|block| block.block_size).sum(),
+            free_blocks: state.free_blocks,
+            free_bytes: state.free_bytes,
         }
     }
 
@@ -139,7 +165,7 @@ impl LargeObjectAllocator {
         }
 
         let removed = state.live.remove(&user_ptr.as_ptr().addr());
-        state.free.push(FreeLargeBlock {
+        state.insert_free_block(FreeLargeBlock {
             block_addr: record.block_addr,
             block_size: record.block_size,
         });
@@ -157,13 +183,13 @@ impl LargeObjectAllocator {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn free_len(&self) -> usize {
-        self.state.lock().free.len()
+        self.state.lock().free_blocks
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FreeLargeBlock, LargeAllocationRecord, LargeObjectAllocator};
+    use super::{LargeAllocationRecord, LargeObjectAllocator};
     use crate::error::FreeError;
     use crate::header::{HEADER_SIZE, user_ptr_from_block_start};
     use core::alloc::Layout;
@@ -347,78 +373,6 @@ mod tests {
         assert_eq!(second, Ok(()));
         assert_eq!(allocator.live_len(), 0);
         assert_eq!(allocator.free_len(), 2);
-    }
-
-    #[test]
-    fn reusable_block_prefers_smallest_sufficient_free_span() {
-        let allocator = LargeObjectAllocator::new();
-        let first = TestBlock::new(HEADER_SIZE + 16_777_280);
-        let second = TestBlock::new(HEADER_SIZE + 20_000_000);
-        let third = TestBlock::new(HEADER_SIZE + 18_000_000);
-
-        let first_block = FreeLargeBlock {
-            block_addr: first.block_start().as_ptr().addr(),
-            block_size: first.size,
-        };
-        let second_block = FreeLargeBlock {
-            block_addr: second.block_start().as_ptr().addr(),
-            block_size: second.size,
-        };
-        let third_block = FreeLargeBlock {
-            block_addr: third.block_start().as_ptr().addr(),
-            block_size: third.size,
-        };
-
-        let user_ptr = user_ptr_from_block_start(first.block_start());
-        allocator.record_live_allocation(
-            user_ptr,
-            first.block_start(),
-            first.size,
-            16_777_217,
-            first.size - HEADER_SIZE,
-        );
-        let _ = allocator.validate_and_release_live_allocation(
-            user_ptr,
-            16_777_217,
-            first.size - HEADER_SIZE,
-        );
-
-        let user_ptr = user_ptr_from_block_start(second.block_start());
-        allocator.record_live_allocation(
-            user_ptr,
-            second.block_start(),
-            second.size,
-            19_999_937,
-            second.size - HEADER_SIZE,
-        );
-        let _ = allocator.validate_and_release_live_allocation(
-            user_ptr,
-            19_999_937,
-            second.size - HEADER_SIZE,
-        );
-
-        let user_ptr = user_ptr_from_block_start(third.block_start());
-        allocator.record_live_allocation(
-            user_ptr,
-            third.block_start(),
-            third.size,
-            17_999_937,
-            third.size - HEADER_SIZE,
-        );
-        let _ = allocator.validate_and_release_live_allocation(
-            user_ptr,
-            17_999_937,
-            third.size - HEADER_SIZE,
-        );
-
-        let reused = allocator
-            .take_reusable_block(HEADER_SIZE + 17_000_000)
-            .unwrap_or_else(|| panic!("expected a reusable large block"));
-
-        assert_eq!(reused, third_block);
-        assert_ne!(reused, first_block);
-        assert_ne!(reused, second_block);
-        assert!(reused.usable_size() >= 17_000_000);
     }
 
     #[test]
