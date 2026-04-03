@@ -120,6 +120,10 @@ impl ThreadCache {
 
     /// Drains one configured batch from the local cache back to the central pool.
     ///
+    /// For slab-backed capacity, this preserves the same reuse model as allocation:
+    /// reclaimed slab blocks are drained before untouched fresh slab capacity, and a
+    /// single drain batch may combine both sources to satisfy the configured count.
+    ///
     /// # Safety
     ///
     /// Every node currently linked in the local list for `class` must be a valid block
@@ -353,6 +357,8 @@ impl LocalSlab {
         addr >= start && addr < self.end_addr && (addr - start).is_multiple_of(self.block_size)
     }
 
+    /// Pops one block from this slab, preferring reclaimed blocks before untouched
+    /// fresh capacity so same-thread frees are reused immediately.
     unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
         if !self.free.is_empty() {
             // SAFETY: the slab owns this free list exclusively through `&mut self`.
@@ -379,6 +385,11 @@ impl LocalSlab {
         unsafe { self.free.push_block(block) };
     }
 
+    /// Detaches up to `max` blocks from this slab for transfer to the central pool.
+    ///
+    /// Reclaimed blocks are drained first, but the returned batch may be topped up
+    /// with untouched fresh capacity so over-limit drains can still return the full
+    /// configured count.
     unsafe fn pop_batch(&mut self, max: usize) -> Batch {
         if max == 0 {
             return Batch::empty();
