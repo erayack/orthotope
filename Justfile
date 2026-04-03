@@ -13,4 +13,9 @@ clippy:
 test:
     cargo test --all-targets
 
+test-release:
+    cargo test --release --all-targets
+
 qa: fmt fmt-check check clippy test
+
+qa-release: fmt fmt-check check clippy test test-release
