@@ -1,7 +1,8 @@
 use core::ptr::NonNull;
 
 use crate::error::{AllocError, FreeError};
-use crate::with_thread_cache;
+use crate::stats::AllocatorStats;
+use crate::{InitError, global_allocator, with_thread_cache};
 
 /// Allocates `size` bytes from the process-global allocator.
 ///
@@ -70,4 +71,22 @@ pub unsafe fn deallocate_with_size(ptr: NonNull<u8>, size: usize) -> Result<(), 
         unsafe { allocator.deallocate_with_size_checked(cache, ptr, size) }
     })
     .map_err(|_| FreeError::GlobalInitFailed)?
+}
+
+/// Returns a best-effort snapshot of the process-global allocator's shared state.
+///
+/// The snapshot includes arena capacity and remaining space, central-pool occupancy,
+/// and large-allocation tracking state. It does not include other threads' private
+/// thread-cache occupancy.
+///
+/// The returned values are not collected atomically across all allocator subsystems.
+/// Under concurrent allocation or free traffic, different fields may reflect slightly
+/// different instants.
+///
+/// # Errors
+///
+/// Returns [`InitError`] when the process-global allocator could not be initialized.
+pub fn global_stats() -> Result<AllocatorStats, &'static InitError> {
+    let allocator = global_allocator()?;
+    Ok(allocator.stats())
 }

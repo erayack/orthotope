@@ -31,6 +31,8 @@ pub mod header;
 pub mod large_object;
 /// Fixed request buckets and class sizing helpers.
 pub mod size_class;
+/// Allocator and thread-cache statistics snapshots.
+pub mod stats;
 /// Caller-owned per-thread cache state for the instance API.
 pub mod thread_cache;
 
@@ -61,8 +63,9 @@ pub(crate) fn with_thread_cache<R>(
 }
 
 pub use crate::allocator::Allocator;
-pub use crate::api::{allocate, deallocate, deallocate_with_size};
+pub use crate::api::{allocate, deallocate, deallocate_with_size, global_stats};
 pub use crate::config::AllocatorConfig;
 pub use crate::error::{AllocError, FreeError, InitError};
 pub use crate::size_class::SizeClass;
+pub use crate::stats::{AllocatorStats, SizeClassStats, ThreadCacheStats};
 pub use crate::thread_cache::ThreadCache;

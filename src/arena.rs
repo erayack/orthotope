@@ -125,6 +125,12 @@ impl Arena {
     }
 
     #[must_use]
+    /// Returns the total usable capacity reserved by this arena mapping.
+    pub const fn capacity(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
     /// Returns the configured block-start alignment.
     pub const fn alignment(&self) -> usize {
         self.alignment

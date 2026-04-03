@@ -1,19 +1,38 @@
 use core::ptr::NonNull;
+use std::vec::Vec;
 
 use crate::allocator::Allocator;
 use crate::central_pool::CentralPool;
 use crate::config::AllocatorConfig;
-use crate::free_list::FreeList;
+use crate::free_list::{Batch, FreeList};
 use crate::size_class::{NUM_CLASSES, SizeClass};
+use crate::stats::{SizeClassStats, ThreadCacheStats};
 
 /// Caller-owned per-thread cache for small-object reuse.
 ///
 /// Use one `ThreadCache` per participating thread when calling [`Allocator`] methods
 /// directly. The process-global convenience API manages this internally.
 pub struct ThreadCache {
-    lists: [FreeList; NUM_CLASSES],
+    classes: [LocalClassCache; NUM_CLASSES],
     config: AllocatorConfig,
     owner: Option<usize>,
+}
+
+struct LocalClassCache {
+    slabs: Vec<LocalSlab>,
+    available_slabs: Vec<usize>,
+    shared: FreeList,
+    shared_len: usize,
+    total_len: usize,
+}
+
+struct LocalSlab {
+    start: NonNull<u8>,
+    end_addr: usize,
+    block_size: usize,
+    capacity: usize,
+    next_fresh: usize,
+    free: FreeList,
 }
 
 impl ThreadCache {
@@ -24,7 +43,7 @@ impl ThreadCache {
     #[must_use]
     pub fn new(config: AllocatorConfig) -> Self {
         Self {
-            lists: core::array::from_fn(|_| FreeList::new()),
+            classes: core::array::from_fn(|_| LocalClassCache::new()),
             config,
             owner: None,
         }
@@ -47,13 +66,13 @@ impl ThreadCache {
 
     #[must_use]
     fn is_empty(&self) -> bool {
-        self.lists.iter().all(FreeList::is_empty)
+        self.classes.iter().all(LocalClassCache::is_empty)
     }
 
     #[must_use]
     pub(crate) fn pop(&mut self, class: SizeClass) -> Option<NonNull<u8>> {
-        // SAFETY: `ThreadCache` has exclusive mutable access to its per-class list.
-        unsafe { self.lists[class.index()].pop_block() }
+        // SAFETY: `ThreadCache` has exclusive mutable access to the class cache.
+        unsafe { self.classes[class.index()].pop_block() }
     }
 
     /// Pushes one block into the local free list for `class`.
@@ -64,15 +83,13 @@ impl ThreadCache {
     /// the intrusive free-list node and not linked in any other list.
     pub(crate) unsafe fn push(&mut self, class: SizeClass, block: NonNull<u8>) {
         // SAFETY: the caller guarantees `block` is a valid detached node for this class,
-        // and `&mut self` provides exclusive access to the destination free list.
-        unsafe {
-            self.lists[class.index()].push_block(block);
-        }
+        // and `&mut self` provides exclusive access to the destination class cache.
+        unsafe { self.classes[class.index()].push_block(block) };
     }
 
     #[must_use]
     pub(crate) const fn needs_refill(&self, class: SizeClass) -> bool {
-        self.lists[class.index()].is_empty()
+        self.classes[class.index()].is_empty()
     }
 
     pub(crate) fn refill_from_central(&mut self, class: SizeClass, central: &CentralPool) -> usize {
@@ -80,17 +97,25 @@ impl ThreadCache {
         let moved = batch.len();
 
         // SAFETY: the batch came from the central pool as a detached chain for this class,
-        // and `&mut self` gives exclusive access to the destination list.
-        unsafe {
-            self.lists[class.index()].push_batch(batch);
-        }
+        // and `&mut self` gives exclusive access to the destination class cache.
+        unsafe { self.classes[class.index()].push_shared_batch(batch) };
 
         moved
     }
 
     #[must_use]
     pub(crate) const fn should_drain(&self, class: SizeClass) -> bool {
-        self.lists[class.index()].len() > self.config.local_limit(class)
+        self.classes[class.index()].len() > self.config.local_limit(class)
+    }
+
+    pub(crate) fn push_owned_slab(
+        &mut self,
+        class: SizeClass,
+        start: NonNull<u8>,
+        block_size: usize,
+        capacity: usize,
+    ) {
+        self.classes[class.index()].push_owned_slab(start, block_size, capacity);
     }
 
     /// Drains one configured batch from the local cache back to the central pool.
@@ -108,12 +133,10 @@ impl ThreadCache {
             return 0;
         }
 
-        let batch = {
-            let list = &mut self.lists[class.index()];
-            // SAFETY: the caller guarantees the local list holds only valid nodes for
-            // this class, and `&mut self` ensures exclusive access during detachment.
-            unsafe { list.pop_batch(self.config.drain_count(class)) }
-        };
+        // SAFETY: the caller guarantees the local class cache holds only valid nodes for
+        // this class, and `&mut self` ensures exclusive access during detachment.
+        let batch =
+            unsafe { self.classes[class.index()].pop_batch(self.config.drain_count(class)) };
         let moved = batch.len();
 
         // SAFETY: the detached batch originated from this class list and remains valid
@@ -134,18 +157,257 @@ impl ThreadCache {
     #[allow(dead_code)]
     pub(crate) unsafe fn drain_all_to_central(&mut self, central: &CentralPool) {
         for class in SizeClass::ALL {
-            let batch = {
-                let list = &mut self.lists[class.index()];
-                // SAFETY: `&mut self` guarantees exclusive access to each per-class list
-                // while its full detached batch is removed.
-                unsafe { list.pop_batch(list.len()) }
-            };
+            loop {
+                let batch = {
+                    let class_cache = &mut self.classes[class.index()];
+                    // SAFETY: `&mut self` guarantees exclusive access to the full class
+                    // cache while detached batches are removed until it is empty.
+                    unsafe { class_cache.pop_batch(class_cache.len()) }
+                };
 
-            // SAFETY: each detached batch came from the matching local class list.
-            unsafe {
-                central.return_batch(class, batch);
+                if batch.is_empty() {
+                    break;
+                }
+
+                // SAFETY: each detached batch came from the matching local class cache.
+                unsafe {
+                    central.return_batch(class, batch);
+                }
             }
         }
+    }
+
+    #[must_use]
+    /// Returns a best-effort snapshot of this thread cache's local occupancy.
+    pub fn stats(&self) -> ThreadCacheStats {
+        let local = core::array::from_fn(|index| {
+            let class = SizeClass::ALL[index];
+            let blocks = self.classes[index].len();
+            SizeClassStats {
+                class,
+                blocks,
+                bytes: blocks * self.config.class_block_size(class),
+            }
+        });
+
+        ThreadCacheStats {
+            is_bound: self.owner.is_some(),
+            local,
+        }
+    }
+}
+
+impl LocalClassCache {
+    const fn new() -> Self {
+        Self {
+            slabs: Vec::new(),
+            available_slabs: Vec::new(),
+            shared: FreeList::new(),
+            shared_len: 0,
+            total_len: 0,
+        }
+    }
+
+    const fn len(&self) -> usize {
+        self.total_len
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    fn push_owned_slab(&mut self, start: NonNull<u8>, block_size: usize, capacity: usize) {
+        let index = self.slabs.len();
+        self.slabs.push(LocalSlab::new(start, block_size, capacity));
+        self.available_slabs.push(index);
+        self.total_len = self
+            .total_len
+            .checked_add(capacity)
+            .unwrap_or_else(|| unreachable!("local class cache size overflowed"));
+    }
+
+    unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
+        while let Some(&index) = self.available_slabs.last() {
+            let slab = &mut self.slabs[index];
+            // SAFETY: the slab owns its free storage exclusively while borrowed mutably here.
+            if let Some(block) = unsafe { slab.pop_block() } {
+                self.total_len -= 1;
+                if !slab.has_available_blocks() {
+                    let _ = self.available_slabs.pop();
+                }
+                return Some(block);
+            }
+
+            let _ = self.available_slabs.pop();
+        }
+
+        // SAFETY: the caller guarantees the shared list only contains valid detached nodes.
+        let block = unsafe { self.shared.pop_block() };
+        if block.is_some() {
+            self.shared_len -= 1;
+            self.total_len -= 1;
+        }
+        block
+    }
+
+    unsafe fn push_block(&mut self, block: NonNull<u8>) {
+        if let Some(index) = self.find_slab(block) {
+            let slab = &mut self.slabs[index];
+            let was_empty = !slab.has_available_blocks();
+            // SAFETY: the caller guarantees `block` is detached and valid for this class.
+            unsafe { slab.push_block(block) };
+            if was_empty {
+                self.available_slabs.push(index);
+            }
+            self.total_len += 1;
+            return;
+        }
+
+        // SAFETY: `block` remains a valid detached node for this class in the shared list.
+        unsafe { self.shared.push_block(block) };
+        self.shared_len += 1;
+        self.total_len += 1;
+    }
+
+    unsafe fn push_shared_batch(&mut self, batch: Batch) {
+        let len = batch.len();
+        // SAFETY: the caller guarantees `batch` is a valid detached chain for this class.
+        unsafe { self.shared.push_batch(batch) };
+        self.shared_len += len;
+        self.total_len += len;
+    }
+
+    unsafe fn pop_batch(&mut self, max: usize) -> Batch {
+        if max == 0 {
+            return Batch::empty();
+        }
+
+        if self.shared_len != 0 {
+            // SAFETY: the shared list contains only valid detached nodes for this class.
+            let batch = unsafe { self.shared.pop_batch(max) };
+            let len = batch.len();
+            self.shared_len -= len;
+            self.total_len -= len;
+            return batch;
+        }
+
+        while let Some(&index) = self.available_slabs.last() {
+            let slab = &mut self.slabs[index];
+            if slab.has_available_blocks() {
+                // SAFETY: each slab free storage belongs exclusively to this class cache.
+                let batch = unsafe { slab.pop_batch(max) };
+                let len = batch.len();
+                self.total_len -= len;
+                if !slab.has_available_blocks() {
+                    let _ = self.available_slabs.pop();
+                }
+                return batch;
+            }
+
+            let _ = self.available_slabs.pop();
+        }
+
+        Batch::empty()
+    }
+
+    fn find_slab(&self, block: NonNull<u8>) -> Option<usize> {
+        let addr = block.as_ptr().addr();
+        let index = self
+            .slabs
+            .partition_point(|slab| slab.start.as_ptr().addr() <= addr);
+        index
+            .checked_sub(1)
+            .filter(|&index| self.slabs[index].contains(block))
+    }
+}
+
+impl LocalSlab {
+    fn new(start: NonNull<u8>, block_size: usize, capacity: usize) -> Self {
+        let slab_bytes = block_size
+            .checked_mul(capacity)
+            .unwrap_or_else(|| unreachable!("local slab size overflowed"));
+        let end_addr = start
+            .as_ptr()
+            .addr()
+            .checked_add(slab_bytes)
+            .unwrap_or_else(|| unreachable!("local slab end overflowed"));
+
+        Self {
+            start,
+            end_addr,
+            block_size,
+            capacity,
+            next_fresh: 0,
+            free: FreeList::new(),
+        }
+    }
+
+    const fn has_available_blocks(&self) -> bool {
+        self.next_fresh < self.capacity || !self.free.is_empty()
+    }
+
+    fn contains(&self, block: NonNull<u8>) -> bool {
+        let addr = block.as_ptr().addr();
+        let start = self.start.as_ptr().addr();
+
+        addr >= start && addr < self.end_addr && (addr - start).is_multiple_of(self.block_size)
+    }
+
+    unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
+        if self.next_fresh < self.capacity {
+            let offset = self
+                .next_fresh
+                .checked_mul(self.block_size)
+                .unwrap_or_else(|| unreachable!("fresh slab offset overflowed"));
+            self.next_fresh += 1;
+            let block = self.start.as_ptr().wrapping_add(offset);
+            // SAFETY: `offset` remains within the slab bounds and `start` is non-null.
+            return Some(unsafe { NonNull::new_unchecked(block) });
+        }
+
+        // SAFETY: the slab owns this free list exclusively through `&mut self`.
+        unsafe { self.free.pop_block() }
+    }
+
+    unsafe fn push_block(&mut self, block: NonNull<u8>) {
+        debug_assert!(self.contains(block));
+        // SAFETY: the caller guarantees `block` is detached and valid for this slab.
+        unsafe { self.free.push_block(block) };
+    }
+
+    unsafe fn pop_batch(&mut self, max: usize) -> Batch {
+        if max == 0 {
+            return Batch::empty();
+        }
+
+        if !self.free.is_empty() {
+            // SAFETY: the slab owns this free list exclusively through `&mut self`.
+            return unsafe { self.free.pop_batch(max) };
+        }
+
+        let available_fresh = self.capacity - self.next_fresh;
+        if available_fresh == 0 {
+            return Batch::empty();
+        }
+
+        let take = core::cmp::min(max, available_fresh);
+        let start_index = self.next_fresh;
+        self.next_fresh += take;
+
+        let mut list = FreeList::new();
+        for index in 0..take {
+            let offset = (start_index + index)
+                .checked_mul(self.block_size)
+                .unwrap_or_else(|| unreachable!("fresh slab batch offset overflowed"));
+            let block = self.start.as_ptr().wrapping_add(offset);
+            // SAFETY: each computed block start lies within this slab and is unique in the batch.
+            let block = unsafe { NonNull::new_unchecked(block) };
+            // SAFETY: each block is detached and valid for this slab's class.
+            unsafe { list.push_block(block) };
+        }
+
+        // SAFETY: the temporary list now owns exactly `take` valid detached blocks.
+        unsafe { list.pop_batch(take) }
     }
 }
 
@@ -429,5 +691,42 @@ mod tests {
 
         let drained = allocator.take_central_batch_for_test(SizeClass::B64, 8);
         assert_eq!(drained.len(), 2);
+    }
+
+    #[test]
+    fn stats_report_local_occupancy_by_size_class() {
+        let mut cache = ThreadCache::new(test_config());
+        let mut small = [
+            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
+            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
+        ];
+        let mut medium = [TestBlock::<{ SizeClass::B256.block_size() }>::new()];
+
+        for block in &mut small {
+            // SAFETY: each test block is detached and valid for the local free list.
+            unsafe {
+                cache.push(SizeClass::B64, block.as_ptr());
+            }
+        }
+        // SAFETY: the test block is detached and valid for the local free list.
+        unsafe {
+            cache.push(SizeClass::B256, medium[0].as_ptr());
+        }
+
+        let stats = cache.stats();
+
+        assert!(!stats.is_bound);
+        assert_eq!(stats.local[SizeClass::B64.index()].blocks, 2);
+        assert_eq!(
+            stats.local[SizeClass::B64.index()].bytes,
+            2 * SizeClass::B64.block_size_for_alignment(test_config().alignment)
+        );
+        assert_eq!(stats.local[SizeClass::B256.index()].blocks, 1);
+        assert_eq!(stats.total_local_blocks(), 3);
+        assert_eq!(
+            stats.total_local_bytes(),
+            2 * SizeClass::B64.block_size_for_alignment(test_config().alignment)
+                + SizeClass::B256.block_size_for_alignment(test_config().alignment)
+        );
     }
 }

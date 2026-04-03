@@ -40,6 +40,11 @@ impl CentralPool {
             list.push_batch(batch);
         }
     }
+
+    #[must_use]
+    pub(crate) fn block_counts(&self) -> [usize; NUM_CLASSES] {
+        core::array::from_fn(|index| self.lists[index].lock().len())
+    }
 }
 
 #[cfg(test)]

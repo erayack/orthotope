@@ -13,6 +13,7 @@ use crate::header::{
 };
 use crate::large_object::LargeObjectAllocator;
 use crate::size_class::SizeClass;
+use crate::stats::{AllocatorStats, SizeClassStats};
 use crate::thread_cache::ThreadCache;
 
 static NEXT_ALLOCATOR_ID: AtomicUsize = AtomicUsize::new(1);
@@ -81,6 +82,36 @@ impl Allocator {
     #[cfg(test)]
     pub(crate) fn take_central_batch_for_test(&self, class: SizeClass, max: usize) -> Batch {
         self.central.take_batch(class, max)
+    }
+
+    #[must_use]
+    /// Returns a best-effort snapshot of allocator-wide shared state.
+    ///
+    /// This snapshot is assembled from independently synchronized subsystems.
+    /// Under concurrent allocation or free traffic, different fields may reflect
+    /// slightly different instants.
+    pub fn stats(&self) -> AllocatorStats {
+        let central_counts = self.central.block_counts();
+        let small_central = core::array::from_fn(|index| {
+            let class = SizeClass::ALL[index];
+            let blocks = central_counts[index];
+            SizeClassStats {
+                class,
+                blocks,
+                bytes: blocks * self.config.class_block_size(class),
+            }
+        });
+        let large = self.large.stats();
+
+        AllocatorStats {
+            arena_capacity: self.arena.capacity(),
+            arena_remaining: self.arena.remaining(),
+            small_central,
+            large_live_allocations: large.live_allocations,
+            large_live_bytes: large.live_bytes,
+            large_free_blocks: large.free_blocks,
+            large_free_bytes: large.free_bytes,
+        }
     }
 
     /// Allocates a block using the provided thread-local cache for small objects.
@@ -218,20 +249,8 @@ impl Allocator {
         };
 
         let carved = span.size() / block_size;
-        let span_start = span.start().as_ptr();
 
-        for index in 0..carved {
-            let offset = index * block_size;
-            let block_start = span_start.wrapping_add(offset);
-            // SAFETY: `span` is an exclusive reservation from the arena and `offset`
-            // advances in exact block-size steps within the reserved range.
-            let block_start = unsafe { NonNull::new_unchecked(block_start) };
-            // SAFETY: each split block is unique, detached, and large enough for the
-            // intrusive free-list node. Small headers are materialized on live allocation.
-            unsafe {
-                cache.push(class, block_start);
-            }
-        }
+        cache.push_owned_slab(class, span.start(), block_size, carved);
 
         Ok(carved)
     }
@@ -432,4 +451,148 @@ const fn validate_allocator_config(config: &AllocatorConfig) -> Result<(), InitE
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Allocator;
+    use crate::config::AllocatorConfig;
+    use crate::size_class::SizeClass;
+    use crate::thread_cache::ThreadCache;
+
+    const fn test_config() -> AllocatorConfig {
+        AllocatorConfig {
+            arena_size: 64 * 1024 * 1024,
+            alignment: 64,
+            refill_target_bytes: 256,
+            local_cache_target_bytes: 384,
+        }
+    }
+
+    #[test]
+    fn stats_report_arena_capacity_and_small_central_occupancy() {
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+        let mut source = ThreadCache::new(test_config());
+        let mut pointers = [None; 4];
+
+        for slot in &mut pointers {
+            let ptr = allocator
+                .allocate_with_cache(&mut source, 32)
+                .unwrap_or_else(|error| panic!("expected small allocation to succeed: {error}"));
+            *slot = Some(ptr);
+        }
+
+        for ptr in pointers.into_iter().flatten() {
+            // SAFETY: each pointer was returned live by `allocator` and is freed exactly once.
+            unsafe {
+                allocator
+                    .deallocate_with_cache(&mut source, ptr)
+                    .unwrap_or_else(|error| panic!("expected small free to succeed: {error}"));
+            }
+        }
+        allocator.drain_thread_cache_on_exit(&mut source);
+
+        let stats = allocator.stats();
+        let class_stats = stats.small_central[SizeClass::B64.index()];
+
+        assert_eq!(stats.arena_capacity, test_config().arena_size);
+        assert!(stats.arena_remaining < stats.arena_capacity);
+        assert_eq!(class_stats.class, SizeClass::B64);
+        assert_eq!(class_stats.blocks, 4);
+        assert_eq!(
+            class_stats.bytes,
+            4 * SizeClass::B64.block_size_for_alignment(64)
+        );
+        assert_eq!(stats.total_small_central_blocks(), 4);
+        assert_eq!(stats.total_small_central_bytes(), class_stats.bytes);
+    }
+
+    #[test]
+    fn stats_report_large_live_and_reusable_bytes() {
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+        let mut cache = ThreadCache::new(test_config());
+
+        let requested = SizeClass::max_small_request() + 1;
+        let ptr = allocator
+            .allocate_with_cache(&mut cache, requested)
+            .unwrap_or_else(|error| panic!("expected large allocation to succeed: {error}"));
+
+        let live_stats = allocator.stats();
+        assert_eq!(live_stats.large_live_allocations, 1);
+        assert!(live_stats.large_live_bytes >= requested);
+        assert_eq!(live_stats.large_free_blocks, 0);
+
+        // SAFETY: `ptr` is a live large allocation returned by `allocator` and is freed once.
+        unsafe {
+            allocator
+                .deallocate_with_cache(&mut cache, ptr)
+                .unwrap_or_else(|error| panic!("expected large free to succeed: {error}"));
+        }
+
+        let freed_stats = allocator.stats();
+        assert_eq!(freed_stats.large_live_allocations, 0);
+        assert_eq!(freed_stats.large_free_blocks, 1);
+        assert_eq!(freed_stats.large_free_bytes, live_stats.large_live_bytes);
+    }
+
+    #[test]
+    fn slab_refill_counts_each_fresh_block_once_and_reuses_freed_block() {
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+        let mut cache = ThreadCache::new(test_config());
+        let class = SizeClass::B64;
+        let request = 32;
+        let carved = test_config().refill_count(class);
+
+        let mut allocated = Vec::with_capacity(carved);
+        for _ in 0..carved {
+            let ptr = allocator
+                .allocate_with_cache(&mut cache, request)
+                .unwrap_or_else(|error| panic!("expected slab allocation to succeed: {error}"));
+            allocated.push(ptr);
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.local[class.index()].blocks, 0);
+        assert!(cache.needs_refill(class));
+
+        let freed = allocated[0];
+        // SAFETY: `freed` is a live small allocation returned above and is freed exactly once.
+        unsafe {
+            allocator
+                .deallocate_with_cache(&mut cache, freed)
+                .unwrap_or_else(|error| panic!("expected slab free to succeed: {error}"));
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.local[class.index()].blocks, 1);
+        assert!(!cache.needs_refill(class));
+
+        let reused = allocator
+            .allocate_with_cache(&mut cache, request)
+            .unwrap_or_else(|error| panic!("expected freed slab block to be reused: {error}"));
+        assert_eq!(reused, freed);
+
+        for ptr in allocated.into_iter().skip(1) {
+            // SAFETY: each remaining pointer is still live and freed exactly once here.
+            unsafe {
+                allocator
+                    .deallocate_with_cache(&mut cache, ptr)
+                    .unwrap_or_else(|error| {
+                        panic!("expected remaining slab allocation free to succeed: {error}")
+                    });
+            }
+        }
+
+        // SAFETY: `reused` is the currently live allocation and is freed exactly once here.
+        unsafe {
+            allocator
+                .deallocate_with_cache(&mut cache, reused)
+                .unwrap_or_else(|error| {
+                    panic!("expected reused slab block free to succeed: {error}")
+                });
+        }
+    }
 }

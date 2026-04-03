@@ -7,6 +7,14 @@ use parking_lot::Mutex;
 use crate::error::FreeError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LargeObjectStats {
+    pub(crate) live_allocations: usize,
+    pub(crate) live_bytes: usize,
+    pub(crate) free_blocks: usize,
+    pub(crate) free_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Live-registry entry for one large allocation.
 pub(crate) struct LargeAllocationRecord {
     pub(crate) block_addr: usize,
@@ -66,6 +74,17 @@ impl LargeObjectAllocator {
             .map(|(index, _)| index)?;
 
         Some(state.free.swap_remove(best_fit_index))
+    }
+
+    #[must_use]
+    pub(crate) fn stats(&self) -> LargeObjectStats {
+        let state = self.state.lock();
+        LargeObjectStats {
+            live_allocations: state.live.len(),
+            live_bytes: state.live.values().map(|record| record.block_size).sum(),
+            free_blocks: state.free.len(),
+            free_bytes: state.free.iter().map(|block| block.block_size).sum(),
+        }
     }
 
     /// Records one newly allocated large block as live.
