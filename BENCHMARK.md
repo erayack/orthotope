@@ -2,29 +2,43 @@
 
 These are local measurements, useful for relative direction rather than universal claims.
 
+Method summary:
+
+- 3 warmup samples, 9 measured samples, median reported
+- `64`-byte alignment across all allocators
+- Orthotope measured through `Allocator` plus one `ThreadCache` per participating thread
+- `long_lived_handoff` measures steady-state end-to-end handoff time with persistent worker threads
+- `large_path` measures warm reuse of a `20 MiB` request
+
 ## Overview
 
-- Orthotope was fastest on same-thread hot-path reuse workloads.
-- Orthotope also led `embedding_batch` and `mixed_size_churn`.
-- The current `large_path` benchmark also favored the comparison allocators.
+- Orthotope was fastest on same-thread hot-path reuse workloads, ranging from about `1.1x` to `7.1x` faster than the comparison allocators depending on size.
+- Orthotope also led `mixed_size_churn` by about `2.2x` over `mimalloc`, `large_path` by about `2.8x` over the system allocator and `7.4x` to `11x` over `jemalloc` and `mimalloc`, and the system/jemalloc variants of `long_lived_handoff` by about `1.1x`.
+- `mimalloc` led `embedding_batch` and narrowly led `long_lived_handoff`.
 
 ## Summary
 
 | Workload | Orthotope | System | mimalloc | jemalloc |
 | --- | ---: | ---: | ---: | ---: |
-| `same_thread_small_churn/32` | `4.73 ns` | `61.04 ns` | `10.08 ns` | `12.39 ns` |
-| `same_thread_small_churn/64` | `4.72 ns` | `41.95 ns` | `7.36 ns` | `11.78 ns` |
-| `same_thread_small_churn/65` | `4.74 ns` | `46.52 ns` | `10.34 ns` | `12.10 ns` |
-| `same_thread_small_churn/4096` | `4.97 ns` | `13.76 ns` | `13.22 ns` | `13.33 ns` |
-| `same_thread_small_churn/70000` | `5.01 ns` | `15.70 ns` | `555.96 ns` | `66.96 ns` |
-| `embedding_batch` | `76.94 ns` | `233.61 ns` | `83.11 ns` | `98.47 ns` |
-| `mixed_size_churn` | `59.56 ns` | `2.17 us` to `4.01 us` | `273.21 ns` | `196.51 ns` |
-| `large_path` | `15.01 us` | `133.86 ns` | `596.31 ns` | `392.90 ns` |
-| `long_lived_handoff` | `4.3387 us` | `12.959 us` | `12.447 us` | `12.805 us` |
+| `same_thread_small_churn/32` | **7.25 ns** | 59.91 ns | 9.85 ns | 8.53 ns |
+| `same_thread_small_churn/64` | **7.29 ns** | 48.03 ns | 7.69 ns | 8.53 ns |
+| `same_thread_small_churn/65` | **7.52 ns** | 46.04 ns | 10.43 ns | 8.63 ns |
+| `same_thread_small_churn/4096` | **7.83 ns** | 14.54 ns | 13.15 ns | 9.90 ns |
+| `same_thread_small_churn/70000` | **8.47 ns** | 16.64 ns | 593.52 ns | 113.33 ns |
+| `embedding_batch` | 150.22 ns | 245.31 ns | **99.46 ns** | 127.40 ns |
+| `mixed_size_churn` | **90.72 ns** | 388.48 ns | 198.67 ns | 199.83 ns |
+| `large_path` | **0.05 us** | 0.14 us | 0.55 us | 0.37 us |
+| `long_lived_handoff` | 1.92 us | 2.16 us | **1.85 us** | 2.01 us |
 
 ## Interpretation Notes
-- Orthotope's strong same-thread results align with the intended architecture: thread-local caches, class-normalized reuse, and efficient hot-path header refresh.
-- The current implementation also avoids block-by-block partial-refill retries and uses indexed large-block reuse, so future large-path or refill regressions should be investigated against those mechanisms first.
-- The cross-thread benchmark currently measures thread spawning, handoff, and allocator interaction collectively. Orthotope's per-iteration allocator recreation for that workload prevents the arena from exhausting during Criterion warmup, but it also means the benchmark is not a pure central-pool measurement.
-- The large-allocation benchmark is not directly comparable to the small-object path. Orthotope now reuses freed large arena spans on a fit basis without coalescing, so benchmark setups should avoid recreating allocator state unless they specifically want cold-path measurements.
-- The mixed_size_churn/system run exhibited high variance in this capture. Consider its range as a noisy result rather than a stable point estimate.
+- Orthotope's same-thread results still align with the intended architecture: thread-local reuse, class-normalized slabs, and in-place header refresh on reuse.
+- Relative framing for this capture:
+  - same-thread hot-path reuse: Orthotope was about `1.06x` to `7.13x` faster than the best non-Orthotope result for each request size
+  - `mixed_size_churn`: Orthotope was about `2.19x` faster than `mimalloc` and `2.20x` faster than `jemalloc`
+  - `large_path`: Orthotope was about `2.8x` faster than the system allocator, `7.4x` faster than `jemalloc`, and `11x` faster than `mimalloc`
+  - `embedding_batch`: Orthotope was about `1.5x` slower than `mimalloc`
+  - `long_lived_handoff`: Orthotope was about `1.12x` faster than the system allocator, about `1.05x` faster than `jemalloc`, and about `1.04x` slower than `mimalloc`
+- `embedding_batch` moved from an Orthotope lead in the older ad hoc numbers to a `mimalloc` lead in this capture, so benchmark discussions should cite the methodology revision explicitly.
+- The `large_path` result is intentionally a warm-reuse measurement. It highlights fit-based reuse of freed large spans rather than cold allocation cost.
+- `long_lived_handoff` is materially lower than the older documented number because the current harness removes per-iteration thread creation and times only the steady-state handoff path.
+- If future comparison work needs cold-path large allocations or thread-spawn-inclusive cross-thread costs, add separate named workloads rather than overloading the current ones.

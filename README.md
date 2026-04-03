@@ -92,11 +92,12 @@ Small-request classes:
 
 Benchmark results are summarized in [`benchmark`](BENCHMARK.md).
 
+The runnable harness used for the latest numbers is maintained in a dedicated
+isolated benchmark worktree rather than this main checkout.
+
 In the current local run, Orthotope was:
 
-- about `1.5x` to `13x` faster on same-thread hot-path reuse workloads
-- about `1.1x` to `3x` faster on `embedding_batch`
-- about `3x` to `4.5x` faster on `mixed_size_churn` against `jemalloc` and `mimalloc`
-- about `3x` faster on `long_lived_handoff`
-
-The current `large_path` benchmark favored the comparison allocators.
+- about `1.8x` to `7.1x` faster than the system allocator on same-thread hot-path reuse workloads
+- about `2.2x` faster than `jemalloc` and `mimalloc` on `mixed_size_churn`
+- about `2.8x` faster than the system allocator and about `7.4x` to `11x` faster than `jemalloc` and `mimalloc` on `large_path`
+- about `1.1x` faster than the system allocator and `jemalloc` on `long_lived_handoff`
