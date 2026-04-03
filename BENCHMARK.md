@@ -38,8 +38,5 @@ Method summary:
   - `mixed_size_churn`: Orthotope was about `2.07x` faster than `mimalloc` and `2.16x` faster than `jemalloc`
   - `large_path`: Orthotope was about `2.33x` faster than the system allocator, `6.67x` faster than `jemalloc`, and `8.83x` faster than `mimalloc`
   - `embedding_batch`: Orthotope was about `1.04x` faster than `mimalloc`
-  - `long_lived_handoff`: Orthotope was about `1.19x` faster than the system allocator, about `1.07x` faster than `jemalloc`, and about `1.02x` faster than `mimalloc`
-- The previous `embedding_batch` loss was workload-specific class normalization overhead, not a general allocator weakness. The dedicated `6 KiB` class removes that mismatch without changing the arena, central-pool, or large-object architecture.
+  - `long_lived_handoff`: Orthotope was about `1.19x` faster than the system allocator, about `1.07x` faster than `jemalloc`, and about `1.02x` faster than `mimalloc`.
 - The `large_path` result is intentionally a warm-reuse measurement. It highlights fit-based reuse of freed large spans rather than cold allocation cost.
-- `long_lived_handoff` is materially lower than the older documented number because the current harness removes per-iteration thread creation and times only the steady-state handoff path.
-- If future comparison work needs cold-path large allocations or thread-spawn-inclusive cross-thread costs, add separate named workloads rather than overloading the current ones.
