@@ -98,9 +98,6 @@ Small-request classes:
 
 Benchmark results are summarized in [`benchmark`](BENCHMARK.md).
 
-The runnable harness used for the latest numbers is maintained in a dedicated
-isolated benchmark worktree rather than this main checkout.
-
 In the current local run, Orthotope was:
 
 - fastest on `embedding_batch`, `mixed_size_churn`, and `large_path` in this local capture
