@@ -24,6 +24,7 @@ struct AllocationHeaderPrefix {
     reserved: [u8; 2],
     requested_size: u32,
     usable_size: u32,
+    owner_cache_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +53,8 @@ pub(crate) struct AllocationHeader {
     reserved: [u8; 2],
     requested_size: u32,
     usable_size: u32,
-    padding: [u8; 48],
+    owner_cache_id: u32,
+    padding: [u8; 44],
 }
 
 impl AllocationHeader {
@@ -68,6 +70,7 @@ impl AllocationHeader {
             class_index,
             requested_size,
             usable_size,
+            0,
         ))
     }
 
@@ -80,6 +83,7 @@ impl AllocationHeader {
             LARGE_CLASS_SENTINEL,
             requested_size,
             usable_size,
+            0,
         ))
     }
 
@@ -129,6 +133,15 @@ impl AllocationHeader {
         self.usable_size as usize
     }
 
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) const fn small_owner_cache_id(&self) -> Option<u32> {
+        match self.kind {
+            AllocationKindTag::Small => Some(self.owner_cache_id),
+            AllocationKindTag::Large => None,
+        }
+    }
+
     #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     #[allow(dead_code)]
@@ -148,6 +161,7 @@ impl AllocationHeader {
         block_start: NonNull<u8>,
         class: SizeClass,
         requested_size: usize,
+        owner_cache_id: u32,
     ) -> Option<NonNull<Self>> {
         let (class_index, requested_size, usable_size) =
             encode_small_fields(class, requested_size)?;
@@ -164,6 +178,7 @@ impl AllocationHeader {
                 class_index,
                 requested_size,
                 usable_size,
+                owner_cache_id,
             );
         }
 
@@ -185,7 +200,7 @@ impl AllocationHeader {
         // untouched blocks are not accepted by deallocation before first allocation.
         unsafe {
             Self::write_small_prefix(header_ptr, class_index, 0, usable_size);
-            ptr::addr_of_mut!((*header_ptr.as_ptr()).padding).write([0; 48]);
+            ptr::addr_of_mut!((*header_ptr.as_ptr()).padding).write([0; 44]);
         }
 
         Some(header_ptr)
@@ -204,6 +219,26 @@ impl AllocationHeader {
         // updating only the requested-size field preserves the routing metadata.
         unsafe {
             ptr::addr_of_mut!((*header_ptr.as_ptr()).requested_size).write(requested_size);
+        }
+
+        Some(header_ptr)
+    }
+
+    pub(crate) fn refresh_small_requested_size_and_owner(
+        block_start: NonNull<u8>,
+        requested_size: usize,
+        owner_cache_id: u32,
+    ) -> Option<NonNull<Self>> {
+        let requested_size = u32::try_from(requested_size).ok()?;
+        let header_ptr = header_from_block_start(block_start);
+
+        debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+
+        // SAFETY: `header_ptr` points to an initialized small-allocation header, so
+        // updating only the requested-size field preserves the routing metadata.
+        unsafe {
+            ptr::addr_of_mut!((*header_ptr.as_ptr()).requested_size).write(requested_size);
+            ptr::addr_of_mut!((*header_ptr.as_ptr()).owner_cache_id).write(owner_cache_id);
         }
 
         Some(header_ptr)
@@ -229,6 +264,7 @@ impl AllocationHeader {
                 LARGE_CLASS_SENTINEL,
                 requested_size,
                 usable_size,
+                0,
             );
         }
 
@@ -240,6 +276,7 @@ impl AllocationHeader {
         class_index: u8,
         requested_size: u32,
         usable_size: u32,
+        owner_cache_id: u32,
     ) -> Self {
         Self {
             magic: HEADER_MAGIC,
@@ -248,7 +285,8 @@ impl AllocationHeader {
             reserved: [0; 2],
             requested_size,
             usable_size,
-            padding: [0; 48],
+            owner_cache_id,
+            padding: [0; 44],
         }
     }
 
@@ -258,6 +296,7 @@ impl AllocationHeader {
         class_index: u8,
         requested_size: u32,
         usable_size: u32,
+        owner_cache_id: u32,
     ) {
         let header = header_ptr.as_ptr();
         // SAFETY: the caller guarantees `header_ptr` points at writable header storage for
@@ -269,6 +308,7 @@ impl AllocationHeader {
             ptr::addr_of_mut!((*header).reserved).write([0; 2]);
             ptr::addr_of_mut!((*header).requested_size).write(requested_size);
             ptr::addr_of_mut!((*header).usable_size).write(usable_size);
+            ptr::addr_of_mut!((*header).owner_cache_id).write(owner_cache_id);
         }
     }
 
@@ -287,6 +327,7 @@ impl AllocationHeader {
                 class_index,
                 requested_size,
                 usable_size,
+                0,
             );
         }
     }
@@ -501,9 +542,9 @@ mod tests {
         let mut storage = MaybeUninit::<TestBlock>::uninit();
         let block_start = test_block_start(&mut storage);
 
-        AllocationHeader::write_small_to_block(block_start, SizeClass::B64, 1)
+        AllocationHeader::write_small_to_block(block_start, SizeClass::B64, 1, 11)
             .unwrap_or_else(|| panic!("expected specialized small writer to succeed"));
-        AllocationHeader::write_small_to_block(block_start, SizeClass::B64, 64)
+        AllocationHeader::write_small_to_block(block_start, SizeClass::B64, 64, 27)
             .unwrap_or_else(|| panic!("expected specialized small rewrite to succeed"));
 
         // SAFETY: `block_start` points at the test block's valid header storage.
@@ -511,6 +552,7 @@ mod tests {
         assert_eq!(header.validate(), Ok(AllocationKind::Small(SizeClass::B64)));
         assert_eq!(header.requested_size(), 64);
         assert_eq!(header.usable_size(), 64);
+        assert_eq!(header.small_owner_cache_id(), Some(27));
     }
 
     #[test]

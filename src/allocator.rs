@@ -223,19 +223,35 @@ impl Allocator {
         })?;
 
         match reuse {
-            BlockReuse::HeaderIntact => {
+            BlockReuse::HotReuseRequestedOnly => {
                 let _ = AllocationHeader::refresh_small_requested_size(block_start, requested_size)
                     .ok_or_else(|| AllocError::OutOfMemory {
                         requested: requested_size,
                         remaining: self.arena.remaining(),
                     })?;
             }
+            BlockReuse::FreshNeedsOwnerRefresh => {
+                let _ = AllocationHeader::refresh_small_requested_size_and_owner(
+                    block_start,
+                    requested_size,
+                    cache.cache_id(),
+                )
+                .ok_or_else(|| AllocError::OutOfMemory {
+                    requested: requested_size,
+                    remaining: self.arena.remaining(),
+                })?;
+            }
             BlockReuse::NeedsHeaderRewrite => {
-                let _ = AllocationHeader::write_small_to_block(block_start, class, requested_size)
-                    .ok_or_else(|| AllocError::OutOfMemory {
-                        requested: requested_size,
-                        remaining: self.arena.remaining(),
-                    })?;
+                let _ = AllocationHeader::write_small_to_block(
+                    block_start,
+                    class,
+                    requested_size,
+                    cache.cache_id(),
+                )
+                .ok_or_else(|| AllocError::OutOfMemory {
+                    requested: requested_size,
+                    remaining: self.arena.remaining(),
+                })?;
             }
         }
 
@@ -348,17 +364,29 @@ impl Allocator {
                 if !self.arena.contains_block_start(block_start) {
                     return Err(FreeError::ForeignPointer);
                 }
-                // SAFETY: the decoded header proved that this user pointer belongs to a
-                // valid small allocation block for `class`.
-                unsafe {
-                    cache.push(class, block_start);
-                }
-
-                if cache.should_drain(class) {
-                    // SAFETY: the local cache for `class` contains only allocator-owned
-                    // blocks for that class, including the block just returned above.
+                let owner_cache_id = header
+                    .small_owner_cache_id()
+                    .ok_or(FreeError::CorruptHeader)?;
+                if owner_cache_id == cache.cache_id() {
+                    // SAFETY: the decoded header proved that this user pointer belongs to a
+                    // valid small allocation block for `class`.
                     unsafe {
-                        cache.drain_excess_to_central(class, &self.central);
+                        cache.push(class, block_start);
+                    }
+
+                    if cache.should_drain(class) {
+                        // SAFETY: the local cache for `class` contains only allocator-owned
+                        // blocks for that class, including the block just returned above.
+                        unsafe {
+                            cache.drain_excess_to_central(class, &self.central);
+                        }
+                    }
+                } else {
+                    // SAFETY: this decoded block belongs to `class` and this allocator;
+                    // remote frees are detached into a dedicated remote buffer before
+                    // batched transfer into the central pool.
+                    unsafe {
+                        cache.push_remote_and_maybe_flush(class, block_start, &self.central);
                     }
                 }
 

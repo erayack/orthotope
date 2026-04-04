@@ -35,10 +35,11 @@ fn pointer_from_addr(addr: usize) -> NonNull<u8> {
 }
 
 #[test]
-fn cross_thread_free_routes_block_into_freeing_thread_cache() {
+fn cross_thread_free_makes_block_visible_to_allocating_thread() {
     let allocator = allocator();
     let request = 32;
     let (allocated_tx, allocated_rx) = mpsc::channel();
+    let (freed_tx, freed_rx) = mpsc::channel();
     let (result_tx, result_rx) = mpsc::channel();
 
     let allocating_allocator = Arc::clone(&allocator);
@@ -52,6 +53,29 @@ fn cross_thread_free_routes_block_into_freeing_thread_cache() {
         match allocated_tx.send(ptr.as_ptr().addr()) {
             Ok(()) => {}
             Err(error) => panic!("expected pointer handoff to succeed: {error}"),
+        }
+
+        match freed_rx.recv() {
+            Ok(()) => {}
+            Err(error) => panic!("expected free completion signal: {error}"),
+        }
+
+        let reused = match allocating_allocator.allocate_with_cache(&mut cache, request) {
+            Ok(ptr) => ptr,
+            Err(error) => {
+                panic!("expected allocating thread reuse allocation to succeed: {error}")
+            }
+        };
+
+        match result_tx.send((ptr.as_ptr().addr(), reused.as_ptr().addr())) {
+            Ok(()) => {}
+            Err(error) => panic!("expected reuse result handoff to succeed: {error}"),
+        }
+
+        // SAFETY: `reused` is currently live in this thread.
+        match unsafe { allocating_allocator.deallocate_with_cache(&mut cache, reused) } {
+            Ok(()) => {}
+            Err(error) => panic!("expected allocating thread cleanup free to succeed: {error}"),
         }
     });
 
@@ -70,20 +94,9 @@ fn cross_thread_free_routes_block_into_freeing_thread_cache() {
             Err(error) => panic!("expected cross-thread free to succeed: {error}"),
         }
 
-        let reused = match freeing_allocator.allocate_with_cache(&mut cache, request) {
-            Ok(ptr) => ptr,
-            Err(error) => panic!("expected freeing thread reuse allocation to succeed: {error}"),
-        };
-
-        match result_tx.send((addr, reused.as_ptr().addr())) {
+        match freed_tx.send(()) {
             Ok(()) => {}
-            Err(error) => panic!("expected reuse result handoff to succeed: {error}"),
-        }
-
-        // SAFETY: `reused` is the currently live allocation in this thread.
-        match unsafe { freeing_allocator.deallocate_with_cache(&mut cache, reused) } {
-            Ok(()) => {}
-            Err(error) => panic!("expected freeing thread cleanup free to succeed: {error}"),
+            Err(error) => panic!("expected free completion signal send to succeed: {error}"),
         }
     });
 

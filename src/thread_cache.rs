@@ -1,4 +1,5 @@
 use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, Ordering};
 use std::vec::Vec;
 
 use crate::allocator::Allocator;
@@ -16,11 +17,13 @@ pub struct ThreadCache {
     classes: [LocalClassCache; NUM_CLASSES],
     config: AllocatorConfig,
     owner: Option<usize>,
+    cache_id: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockReuse {
-    HeaderIntact,
+    HotReuseRequestedOnly,
+    FreshNeedsOwnerRefresh,
     NeedsHeaderRewrite,
 }
 
@@ -31,8 +34,12 @@ struct LocalClassCache {
     recent_slab: Option<usize>,
     shared: FreeList,
     shared_len: usize,
+    remote: FreeList,
+    remote_len: usize,
     total_len: usize,
 }
+
+static NEXT_CACHE_ID: AtomicU32 = AtomicU32::new(1);
 
 struct LocalSlab {
     start: NonNull<u8>,
@@ -54,7 +61,13 @@ impl ThreadCache {
             classes: core::array::from_fn(|_| LocalClassCache::new()),
             config,
             owner: None,
+            cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn cache_id(&self) -> u32 {
+        self.cache_id
     }
 
     pub(crate) fn bind_to_allocator(&mut self, allocator: &Allocator) {
@@ -170,6 +183,11 @@ impl ThreadCache {
     #[allow(dead_code)]
     pub(crate) unsafe fn drain_all_to_central(&mut self, central: &CentralPool) {
         for class in SizeClass::ALL {
+            // SAFETY: remote lists carry detached valid blocks for this class.
+            unsafe {
+                self.classes[class.index()].drain_remote_to_central(central, class);
+            }
+
             loop {
                 let batch = {
                     let class_cache = &mut self.classes[class.index()];
@@ -190,12 +208,35 @@ impl ThreadCache {
         }
     }
 
+    /// Pushes one cross-thread-freed block into the class-local remote buffer and
+    /// flushes to the central pool when the buffer reaches the configured batch size.
+    ///
+    /// # Safety
+    ///
+    /// `block` must be a valid detached allocator block for `class`.
+    pub(crate) unsafe fn push_remote_and_maybe_flush(
+        &mut self,
+        class: SizeClass,
+        block: NonNull<u8>,
+        central: &CentralPool,
+    ) -> usize {
+        let class_cache = &mut self.classes[class.index()];
+        // SAFETY: caller guarantees the block is detached and valid for this class.
+        unsafe {
+            class_cache.push_remote(block);
+        }
+        // SAFETY: remote list contains detached valid blocks for this class.
+        unsafe {
+            class_cache.flush_remote_to_central(central, class, self.config.refill_count(class))
+        }
+    }
+
     #[must_use]
     /// Returns a best-effort snapshot of this thread cache's local occupancy.
     pub fn stats(&self) -> ThreadCacheStats {
         let local = core::array::from_fn(|index| {
             let class = SizeClass::ALL[index];
-            let blocks = self.classes[index].len();
+            let blocks = self.classes[index].stats_len();
             SizeClassStats {
                 class,
                 blocks,
@@ -223,6 +264,8 @@ impl LocalClassCache {
             recent_slab: None,
             shared: FreeList::new(),
             shared_len: 0,
+            remote: FreeList::new(),
+            remote_len: 0,
             total_len: 0,
         }
     }
@@ -231,8 +274,12 @@ impl LocalClassCache {
         self.total_len
     }
 
+    const fn stats_len(&self) -> usize {
+        self.total_len + self.remote_len
+    }
+
     const fn is_empty(&self) -> bool {
-        self.total_len == 0
+        self.total_len == 0 && self.remote_len == 0
     }
 
     fn push_owned_slab(&mut self, start: NonNull<u8>, block_size: usize, capacity: usize) {
@@ -249,7 +296,7 @@ impl LocalClassCache {
     unsafe fn pop_block(&mut self) -> Option<(NonNull<u8>, BlockReuse)> {
         if let Some(block) = self.hot_block.take() {
             self.total_len -= 1;
-            return Some((block, BlockReuse::HeaderIntact));
+            return Some((block, BlockReuse::HotReuseRequestedOnly));
         }
 
         while let Some(&index) = self.available_slabs.last() {
@@ -379,6 +426,43 @@ impl LocalClassCache {
             .checked_sub(1)
             .filter(|&index| self.slabs[index].contains(block))
     }
+
+    unsafe fn push_remote(&mut self, block: NonNull<u8>) {
+        // SAFETY: caller guarantees this block is detached and valid for the class.
+        unsafe { self.remote.push_block(block) };
+        self.remote_len += 1;
+    }
+
+    unsafe fn flush_remote_to_central(
+        &mut self,
+        central: &CentralPool,
+        class: SizeClass,
+        threshold: usize,
+    ) -> usize {
+        if self.remote_len < threshold {
+            return 0;
+        }
+
+        // SAFETY: remote list stores detached valid blocks for this class.
+        let batch = unsafe { self.remote.pop_batch(threshold) };
+        let moved = batch.len();
+        self.remote_len -= moved;
+
+        // SAFETY: detached batch can be transferred to central for this class.
+        unsafe { central.return_batch(class, batch) };
+        moved
+    }
+
+    unsafe fn drain_remote_to_central(&mut self, central: &CentralPool, class: SizeClass) {
+        while self.remote_len != 0 {
+            // SAFETY: remote list stores detached valid blocks for this class.
+            let batch = unsafe { self.remote.pop_batch(self.remote_len) };
+            let moved = batch.len();
+            self.remote_len -= moved;
+            // SAFETY: detached batch can be transferred to central for this class.
+            unsafe { central.return_batch(class, batch) };
+        }
+    }
 }
 
 impl LocalSlab {
@@ -432,7 +516,7 @@ impl LocalSlab {
             // SAFETY: `offset` remains within the slab bounds and `start` is non-null.
             return Some((
                 unsafe { NonNull::new_unchecked(block) },
-                BlockReuse::HeaderIntact,
+                BlockReuse::FreshNeedsOwnerRefresh,
             ));
         }
 
