@@ -3,7 +3,8 @@
 //!
 //! Use [`allocate`] and [`deallocate`] for the process-global convenience API, or
 //! construct an [`Allocator`] plus one [`ThreadCache`] per participating thread for
-//! direct instance-oriented use.
+//! direct instance-oriented use. Downstream binaries may also opt in to a
+//! `#[global_allocator]` adapter via [`OrthotopeGlobalAlloc`].
 //!
 //! Only free live pointers returned by Orthotope. Small-object double free remains
 //! undefined behavior, and same-arena pointer forgery is not guaranteed to be detected.
@@ -25,6 +26,8 @@ pub mod config;
 pub mod error;
 /// Intrusive free-list primitives used by allocator internals.
 pub mod free_list;
+/// Optional `GlobalAlloc` adapter for downstream binary opt-in.
+pub mod global_alloc;
 /// Allocation-header constants and pointer-layout helpers.
 pub mod header;
 /// Live tracking for allocations above the largest small class.
@@ -53,12 +56,24 @@ fn global_allocator() -> Result<&'static Allocator, &'static InitError> {
 pub(crate) fn with_thread_cache<R>(
     f: impl FnOnce(&Allocator, &mut ThreadCache) -> R,
 ) -> Result<R, &'static InitError> {
+    match try_with_thread_cache(f) {
+        Ok(Some(result)) => Ok(result),
+        Ok(None) => panic!("global thread cache is already borrowed in this thread"),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn try_with_thread_cache<R>(
+    f: impl FnOnce(&Allocator, &mut ThreadCache) -> R,
+) -> Result<Option<R>, &'static InitError> {
     let allocator = global_allocator()?;
 
     THREAD_CACHE.with(|cache| {
-        let mut handle = cache.borrow_mut();
+        let Ok(mut handle) = cache.try_borrow_mut() else {
+            return Ok(None);
+        };
         let handle = handle.get_or_insert_with(|| ThreadCacheHandle::new(allocator));
-        Ok(handle.with_parts(f))
+        Ok(Some(handle.with_parts(f)))
     })
 }
 
@@ -66,6 +81,7 @@ pub use crate::allocator::Allocator;
 pub use crate::api::{allocate, deallocate, deallocate_with_size, global_stats};
 pub use crate::config::AllocatorConfig;
 pub use crate::error::{AllocError, FreeError, InitError};
+pub use crate::global_alloc::OrthotopeGlobalAlloc;
 pub use crate::size_class::SizeClass;
 pub use crate::stats::{AllocatorStats, SizeClassStats, ThreadCacheStats};
 pub use crate::thread_cache::ThreadCache;

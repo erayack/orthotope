@@ -49,6 +49,21 @@ for instance-oriented use. An empty cache may be rebound to a different allocato
 instance, but reusing a non-empty cache across allocators panics instead of silently
 rehoming cached blocks.
 
+For opt-in drop-in usage in existing binaries, the crate also exposes
+`OrthotopeGlobalAlloc`:
+
+```rust
+use orthotope::OrthotopeGlobalAlloc;
+
+#[global_allocator]
+static GLOBAL: OrthotopeGlobalAlloc = OrthotopeGlobalAlloc::new();
+```
+
+The shim intentionally falls back to `std::alloc::System` for layouts with `size == 0`
+or `align() > 64`. It also has a best-effort fallback for rare reentrant TLS-cache
+borrow cases. `global_stats()` only reports Orthotope-managed allocations, not
+system-fallback allocations.
+
 ## Behavior
 
 - small allocations use thread-local reuse first, then central-pool refill, then arena carving
@@ -78,6 +93,11 @@ fit-based reuse for future same-size or smaller large requests.
 Because large blocks may later be reused at the same address, stale large pointers after
 address reuse are not guaranteed to be distinguishable by the raw-pointer free API.
 Using such pointers still violates the `unsafe` contract.
+
+When using `OrthotopeGlobalAlloc`, `GlobalAlloc::dealloc` cannot return typed errors.
+If Orthotope detects an invalid free on the Orthotope-managed path, the shim aborts the
+process instead of continuing in an invalid state. The only tolerated leak path is a
+reentrant TLS-cache borrow during panic unwind.
 
 Small-request classes:
 
