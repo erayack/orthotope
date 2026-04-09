@@ -114,9 +114,12 @@ unsafe impl GlobalAlloc for OrthotopeGlobalAlloc {
                     return;
                 };
                 if let Some(raw_ptr) = fallback_raw_ptr(ptr.as_ptr()) {
-                    // SAFETY: this pointer was allocated by `System` on the fallback path
-                    // and carries its original raw allocation address in the in-band prefix.
-                    unsafe { System.dealloc(raw_ptr, fallback_layout(layout)) };
+                    let Some(raw_layout) = try_fallback_layout(layout) else {
+                        process::abort();
+                    };
+                    // SAFETY: the fallback prefix proves `raw_ptr` came from `System.alloc`
+                    // with this derived fallback layout for the same original request.
+                    unsafe { System.dealloc(raw_ptr, raw_layout) };
                     return;
                 }
                 let result = try_with_thread_cache(|allocator, cache| {
@@ -135,7 +138,9 @@ unsafe impl GlobalAlloc for OrthotopeGlobalAlloc {
 }
 
 fn fallback_alloc(layout: Layout) -> *mut u8 {
-    let raw_layout = fallback_layout(layout);
+    let Some(raw_layout) = try_fallback_layout(layout) else {
+        return core::ptr::null_mut();
+    };
     // SAFETY: delegated directly to the system allocator using the larger fallback layout.
     let raw_ptr = unsafe { System.alloc(raw_layout) };
     if raw_ptr.is_null() {
@@ -195,16 +200,14 @@ const fn fallback_alignment(layout: Layout) -> usize {
     }
 }
 
-fn fallback_layout(layout: Layout) -> Layout {
+fn try_fallback_layout(layout: Layout) -> Option<Layout> {
     let alignment = fallback_alignment(layout);
     let prefix_size = size_of::<SystemFallbackPrefix>();
     let size = layout
         .size()
         .checked_add(prefix_size)
-        .and_then(|size| size.checked_add(alignment - 1))
-        .unwrap_or_else(|| panic!("fallback layout size overflowed"));
-    Layout::from_size_align(size, alignment)
-        .unwrap_or_else(|error| panic!("fallback layout must stay valid: {error}"))
+        .and_then(|size| size.checked_add(alignment - 1))?;
+    Layout::from_size_align(size, alignment).ok()
 }
 
 const fn align_up(value: usize, alignment: usize) -> Option<usize> {
@@ -280,6 +283,36 @@ mod tests {
         assert_eq!(prefix.raw_addr, raw_ptr.addr());
 
         // SAFETY: `raw_ptr` came from `fallback_alloc(layout)` above.
-        unsafe { System.dealloc(raw_ptr, super::fallback_layout(layout)) };
+        let raw_layout = super::try_fallback_layout(layout)
+            .unwrap_or_else(|| panic!("fallback allocation should preserve a valid layout"));
+        // SAFETY: `raw_ptr` came from `fallback_alloc(layout)` above with `raw_layout`.
+        unsafe { System.dealloc(raw_ptr, raw_layout) };
+    }
+
+    #[test]
+    fn reentrant_huge_layout_returns_null_instead_of_panicking() {
+        let shim = crate::OrthotopeGlobalAlloc::new();
+        let layout = Layout::from_size_align(isize::MAX as usize - 7, 8)
+            .unwrap_or_else(|error| panic!("expected valid near-limit layout: {error}"));
+
+        let outcome = std::panic::catch_unwind(|| {
+            crate::try_with_thread_cache(|_, _| {
+                // SAFETY: this intentionally exercises the shim with a valid layout while the
+                // thread cache is already mutably borrowed to simulate allocator reentrancy.
+                unsafe { shim.alloc(layout) }
+            })
+            .unwrap_or_else(|error| panic!("expected global allocator init to succeed: {error}"))
+            .unwrap_or_else(|| panic!("outer thread-cache borrow should succeed"))
+        });
+
+        assert!(
+            outcome.is_ok(),
+            "reentrant allocation should return null, not panic"
+        );
+        let ptr = outcome.unwrap_or_else(|_| unreachable!("assertion above ensures success"));
+        assert!(
+            ptr.is_null(),
+            "near-limit reentrant allocation should fail with null"
+        );
     }
 }
