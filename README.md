@@ -116,11 +116,17 @@ Small-request classes:
 
 ## Benchmarking
 
-Benchmark results are summarized in [`benchmark`](BENCHMARK.md).
+Benchmark results are summarized in [`BENCHMARK`](BENCHMARK.md).
 
 In the current local run, Orthotope was:
 
-- fastest on `embedding_batch`, `mixed_size_churn`, and `large_path` in this local capture
-- fastest on four of the five same-thread hot-path reuse sizes, with `mimalloc` narrowly leading only `64`
-- about `2.1x` faster than `mimalloc` and `2.2x` faster than `jemalloc` on `mixed_size_churn`
-- about `2.3x` faster than the system allocator and about `6.7x` to `8.8x` faster than `jemalloc` and `mimalloc` on `large_path`
+- fastest on 7 of 9 workloads against system, mimalloc, and jemalloc
+- about `49x` faster than `mimalloc` on `same_thread_small_churn/70000`
+- about `2.1x` faster than `mimalloc` and `2.1x` faster than `jemalloc` on `mixed_size_churn`
+- about `8.8x` faster than `mimalloc` and `6.3x` faster than `jemalloc` on `large_path`
+
+The [`bench/`](bench/) directory contains the harness used to produce these numbers. It runs each workload against Orthotope, the system allocator, mimalloc, and jemalloc, and prints a markdown table of medians.
+
+```sh
+just bench
+```
