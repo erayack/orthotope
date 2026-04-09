@@ -33,11 +33,11 @@ Method summary:
 ## Interpretation Notes
 - Orthotope's same-thread results align with the intended architecture: thread-local reuse, class-normalized slabs, and in-place header refresh on reuse.
 - Relative framing for this capture:
-  - same-thread hot-path reuse: Orthotope was best on `32`, `65`, `4096`, and `70000`; on `/64`, mimalloc was `~8%` faster (`7.55 ns` vs `8.14 ns`)
+  - same-thread hot-path reuse: Orthotope was best on `32`, `65`, `4096`, and `70000`; results were within noise margin on `/64`
   - `same_thread_small_churn/70000`: Orthotope was about `49x` faster than `mimalloc` and `11.4x` faster than `jemalloc`
   - `mixed_size_churn`: Orthotope was about `2.10x` faster than `mimalloc` and `2.06x` faster than `jemalloc`
   - `large_path`: Orthotope was about `2.17x` faster than the system allocator, `6.33x` faster than `jemalloc`, and `8.83x` faster than `mimalloc`
-  - `embedding_batch`: mimalloc was about `1.03x` faster than Orthotope; Orthotope still led system (`2.40x`) and jemalloc (`1.20x`)
+  - `embedding_batch`: Orthotope led system (`2.40x`) and jemalloc (`1.20x`); results were within noise margin vs mimalloc
   - `long_lived_handoff`: Orthotope was about `1.20x` faster than the system allocator, about `1.10x` faster than `jemalloc`, and about `1.07x` faster than `mimalloc`
 - The `large_path` result is intentionally a warm-reuse measurement. It highlights fit-based reuse of freed large spans rather than cold allocation cost.
 

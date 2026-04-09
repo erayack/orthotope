@@ -121,9 +121,9 @@ Benchmark results are summarized in [`BENCHMARK`](BENCHMARK.md).
 In the current local run, Orthotope was:
 
 - fastest on 7 of 9 workloads against system, mimalloc, and jemalloc
-- about `49x` faster than `mimalloc` on `same_thread_small_churn/70000`
 - about `2.1x` faster than `mimalloc` and `2.1x` faster than `jemalloc` on `mixed_size_churn`
 - about `8.8x` faster than `mimalloc` and `6.3x` faster than `jemalloc` on `large_path`
+- about `49x` faster than `mimalloc` on `same_thread_small_churn/70000`
 
 The [`bench/`](bench/) directory contains the harness used to produce these numbers. It runs each workload against Orthotope, the system allocator, mimalloc, and jemalloc, and prints a markdown table of medians.
 
