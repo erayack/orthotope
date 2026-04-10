@@ -53,16 +53,6 @@ fn global_allocator() -> Result<&'static Allocator, &'static InitError> {
     GLOBAL_ALLOCATOR.as_ref()
 }
 
-pub(crate) fn with_thread_cache<R>(
-    f: impl FnOnce(&Allocator, &mut ThreadCache) -> R,
-) -> Result<R, &'static InitError> {
-    match try_with_thread_cache(f) {
-        Ok(Some(result)) => Ok(result),
-        Ok(None) => panic!("global thread cache is already borrowed in this thread"),
-        Err(error) => Err(error),
-    }
-}
-
 pub(crate) fn try_with_thread_cache<R>(
     f: impl FnOnce(&Allocator, &mut ThreadCache) -> R,
 ) -> Result<Option<R>, &'static InitError> {
