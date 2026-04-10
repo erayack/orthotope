@@ -209,12 +209,14 @@ impl ThreadCache {
     }
 
     /// Pushes one cross-thread-freed block into the class-local remote buffer and
-    /// flushes to the central pool when the buffer reaches the configured batch size.
+    /// immediately flushes remote frees to the central pool so other threads can
+    /// observe released capacity even when the freeing thread never accumulates a
+    /// full batch.
     ///
     /// # Safety
     ///
     /// `block` must be a valid detached allocator block for `class`.
-    pub(crate) unsafe fn push_remote_and_maybe_flush(
+    pub(crate) unsafe fn push_remote_and_flush(
         &mut self,
         class: SizeClass,
         block: NonNull<u8>,
@@ -225,10 +227,10 @@ impl ThreadCache {
         unsafe {
             class_cache.push_remote(block);
         }
-        // SAFETY: remote list contains detached valid blocks for this class.
-        unsafe {
-            class_cache.flush_remote_to_central(central, class, self.config.refill_count(class))
-        }
+        // SAFETY: remote list contains detached valid blocks for this class. Flush
+        // eagerly so a single cross-thread free cannot strand the only reusable block
+        // behind a batch threshold in the freeing thread's cache.
+        unsafe { class_cache.flush_remote_to_central(central, class, 1) }
     }
 
     #[must_use]

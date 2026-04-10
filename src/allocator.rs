@@ -386,7 +386,7 @@ impl Allocator {
                     // remote frees are detached into a dedicated remote buffer before
                     // batched transfer into the central pool.
                     unsafe {
-                        cache.push_remote_and_maybe_flush(class, block_start, &self.central);
+                        cache.push_remote_and_flush(class, block_start, &self.central);
                     }
                 }
 

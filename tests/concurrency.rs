@@ -116,6 +116,77 @@ fn cross_thread_free_makes_block_visible_to_allocating_thread() {
 }
 
 #[test]
+fn single_remote_free_does_not_strand_the_only_block_until_remote_threshold_is_met() {
+    let allocator = Arc::new(
+        Allocator::new(AllocatorConfig {
+            arena_size: 128,
+            alignment: 64,
+            refill_target_bytes: 256,
+            local_cache_target_bytes: 256,
+        })
+        .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}")),
+    );
+    let (allocated_tx, allocated_rx) = mpsc::channel();
+    let (freed_tx, freed_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+
+    let allocating_allocator = Arc::clone(&allocator);
+    let allocating_thread = thread::spawn(move || {
+        let mut cache = ThreadCache::new(*allocating_allocator.config());
+        let ptr = allocating_allocator
+            .allocate_with_cache(&mut cache, 32)
+            .unwrap_or_else(|error| panic!("expected initial allocation to succeed: {error}"));
+
+        allocated_tx
+            .send(ptr.as_ptr().addr())
+            .unwrap_or_else(|error| panic!("expected pointer handoff to succeed: {error}"));
+        freed_rx
+            .recv()
+            .unwrap_or_else(|error| panic!("expected free completion signal: {error}"));
+
+        let reused = allocating_allocator.allocate_with_cache(&mut cache, 32);
+        result_tx
+            .send((ptr.as_ptr().addr(), reused.map(|ptr| ptr.as_ptr().addr())))
+            .unwrap_or_else(|error| panic!("expected result handoff to succeed: {error}"));
+    });
+
+    let freeing_allocator = Arc::clone(&allocator);
+    let freeing_thread = thread::spawn(move || {
+        let addr = allocated_rx
+            .recv()
+            .unwrap_or_else(|error| panic!("expected allocated pointer: {error}"));
+        let ptr = pointer_from_addr(addr);
+        let mut cache = ThreadCache::new(*freeing_allocator.config());
+
+        // SAFETY: `ptr` is a live allocation produced by the paired allocating thread.
+        unsafe {
+            freeing_allocator
+                .deallocate_with_cache(&mut cache, ptr)
+                .unwrap_or_else(|error| panic!("expected cross-thread free to succeed: {error}"));
+        }
+
+        freed_tx
+            .send(())
+            .unwrap_or_else(|error| panic!("expected free completion signal send: {error}"));
+    });
+
+    allocating_thread
+        .join()
+        .unwrap_or_else(|error| panic!("expected allocating thread to complete: {error:?}"));
+    freeing_thread
+        .join()
+        .unwrap_or_else(|error| panic!("expected freeing thread to complete: {error:?}"));
+
+    let (original_addr, reused) = result_rx
+        .recv()
+        .unwrap_or_else(|error| panic!("expected result payload: {error}"));
+    let reused_addr =
+        reused.unwrap_or_else(|error| panic!("expected freed block to become reusable: {error}"));
+
+    assert_eq!(reused_addr, original_addr);
+}
+
+#[test]
 fn thread_exit_drain_makes_cached_blocks_visible_to_other_threads() {
     let _guard = GLOBAL_API_TEST_LOCK
         .lock()
