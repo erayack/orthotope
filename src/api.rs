@@ -102,6 +102,25 @@ mod tests {
     use super::{allocate, deallocate};
     use crate::error::{AllocError, FreeError};
     use crate::try_with_thread_cache;
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+
+    struct AllocateDuringTlsTeardown {
+        result: Arc<Mutex<Option<Result<(), AllocError>>>>,
+    }
+
+    impl Drop for AllocateDuringTlsTeardown {
+        fn drop(&mut self) {
+            let outcome = allocate(32).map(|_| ());
+            *self.result.lock().unwrap_or_else(|error| {
+                panic!("expected teardown result lock to succeed: {error}")
+            }) = Some(outcome);
+        }
+    }
+
+    thread_local! {
+        static TEARDOWN_PROBE: RefCell<Option<AllocateDuringTlsTeardown>> = const { RefCell::new(None) };
+    }
 
     fn reentrant_allocate_result() -> Result<core::ptr::NonNull<u8>, AllocError> {
         try_with_thread_cache(|_, _| allocate(32))
@@ -165,5 +184,40 @@ mod tests {
             outcome.is_ok(),
             "public deallocate should return an error instead of panicking on reentrant thread-cache borrow"
         );
+    }
+
+    #[test]
+    fn public_allocate_returns_typed_error_after_thread_cache_tls_is_destroyed() {
+        let teardown_result = Arc::new(Mutex::new(None));
+        let thread_result = Arc::clone(&teardown_result);
+
+        let handle = std::thread::spawn(move || {
+            TEARDOWN_PROBE.with(|probe| {
+                *probe.borrow_mut() = Some(AllocateDuringTlsTeardown {
+                    result: thread_result,
+                });
+            });
+
+            let ptr = allocate(32)
+                .unwrap_or_else(|error| panic!("expected initial allocation to succeed: {error}"));
+            // SAFETY: `ptr` is still live here and is freed exactly once before thread exit.
+            unsafe {
+                deallocate(ptr).unwrap_or_else(|error| {
+                    panic!("expected cleanup deallocation to succeed: {error}")
+                });
+            }
+        });
+
+        handle
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+
+        let outcome = teardown_result
+            .lock()
+            .unwrap_or_else(|error| panic!("expected teardown result lock to succeed: {error}"))
+            .take()
+            .unwrap_or_else(|| panic!("expected teardown probe to record a result"));
+
+        assert_eq!(outcome, Err(AllocError::GlobalInitFailed));
     }
 }

@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use std::vec::Vec;
 
 use crate::allocator::Allocator;
-use crate::central_pool::CentralPool;
+use crate::central_pool::{CentralPool, CentralRefill, SlabFreshMode};
 use crate::config::AllocatorConfig;
 use crate::free_list::{Batch, FreeList};
 use crate::size_class::{NUM_CLASSES, SizeClass};
@@ -48,6 +48,7 @@ struct LocalSlab {
     capacity: usize,
     next_fresh: usize,
     free: FreeList,
+    fresh_mode: SlabFreshMode,
 }
 
 impl ThreadCache {
@@ -115,14 +116,28 @@ impl ThreadCache {
     }
 
     pub(crate) fn refill_from_central(&mut self, class: SizeClass, central: &CentralPool) -> usize {
-        let batch = central.take_batch(class, self.config.refill_count(class));
-        let moved = batch.len();
+        match central.take_refill(class, self.config.refill_count(class)) {
+            CentralRefill::Empty => 0,
+            CentralRefill::Batch(batch) => {
+                let moved = batch.len();
 
-        // SAFETY: the batch came from the central pool as a detached chain for this class,
-        // and `&mut self` gives exclusive access to the destination class cache.
-        unsafe { self.classes[class.index()].push_shared_batch(batch) };
+                // SAFETY: the batch came from the central pool as a detached chain for
+                // this class, and `&mut self` gives exclusive access to the destination.
+                unsafe { self.classes[class.index()].push_shared_batch(batch) };
 
-        moved
+                moved
+            }
+            CentralRefill::Slab {
+                start,
+                block_size,
+                capacity,
+                fresh_mode,
+            } => {
+                self.classes[class.index()]
+                    .push_owned_slab(start, block_size, capacity, fresh_mode);
+                capacity
+            }
+        }
     }
 
     #[must_use]
@@ -136,8 +151,9 @@ impl ThreadCache {
         start: NonNull<u8>,
         block_size: usize,
         capacity: usize,
+        fresh_mode: SlabFreshMode,
     ) {
-        self.classes[class.index()].push_owned_slab(start, block_size, capacity);
+        self.classes[class.index()].push_owned_slab(start, block_size, capacity, fresh_mode);
     }
 
     /// Drains one configured batch from the local cache back to the central pool.
@@ -284,10 +300,37 @@ impl LocalClassCache {
         self.total_len == 0 && self.remote_len == 0
     }
 
-    fn push_owned_slab(&mut self, start: NonNull<u8>, block_size: usize, capacity: usize) {
-        let index = self.slabs.len();
-        self.slabs.push(LocalSlab::new(start, block_size, capacity));
-        self.available_slabs.push(index);
+    fn push_owned_slab(
+        &mut self,
+        start: NonNull<u8>,
+        block_size: usize,
+        capacity: usize,
+        fresh_mode: SlabFreshMode,
+    ) {
+        let start_addr = start.as_ptr().addr();
+        let index = match self
+            .slabs
+            .binary_search_by_key(&start_addr, |slab| slab.start.as_ptr().addr())
+        {
+            Ok(index) => {
+                self.slabs[index].reset(start, block_size, capacity, fresh_mode);
+                index
+            }
+            Err(index) => {
+                self.slabs.insert(
+                    index,
+                    LocalSlab::new(start, block_size, capacity, fresh_mode),
+                );
+                index
+            }
+        };
+
+        self.available_slabs = self
+            .slabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slab)| slab.has_available_blocks().then_some(index))
+            .collect();
         self.recent_slab = Some(index);
         self.total_len = self
             .total_len
@@ -468,7 +511,12 @@ impl LocalClassCache {
 }
 
 impl LocalSlab {
-    fn new(start: NonNull<u8>, block_size: usize, capacity: usize) -> Self {
+    fn new(
+        start: NonNull<u8>,
+        block_size: usize,
+        capacity: usize,
+        fresh_mode: SlabFreshMode,
+    ) -> Self {
         let slab_bytes = block_size
             .checked_mul(capacity)
             .unwrap_or_else(|| unreachable!("local slab size overflowed"));
@@ -485,7 +533,23 @@ impl LocalSlab {
             capacity,
             next_fresh: 0,
             free: FreeList::new(),
+            fresh_mode,
         }
+    }
+
+    fn reset(
+        &mut self,
+        start: NonNull<u8>,
+        block_size: usize,
+        capacity: usize,
+        fresh_mode: SlabFreshMode,
+    ) {
+        debug_assert_eq!(self.start, start);
+        debug_assert_eq!(self.block_size, block_size);
+        debug_assert_eq!(self.capacity, capacity);
+        self.next_fresh = 0;
+        self.free = FreeList::new();
+        self.fresh_mode = fresh_mode;
     }
 
     const fn has_available_blocks(&self) -> bool {
@@ -516,10 +580,13 @@ impl LocalSlab {
             self.next_fresh += 1;
             let block = self.start.as_ptr().wrapping_add(offset);
             // SAFETY: `offset` remains within the slab bounds and `start` is non-null.
-            return Some((
-                unsafe { NonNull::new_unchecked(block) },
-                BlockReuse::FreshNeedsOwnerRefresh,
-            ));
+            let reuse = match self.fresh_mode {
+                SlabFreshMode::Preinitialized => BlockReuse::FreshNeedsOwnerRefresh,
+                SlabFreshMode::MustRewrite => BlockReuse::NeedsHeaderRewrite,
+            };
+            // SAFETY: `offset` was derived from bounded slab capacity, so `block`
+            // stays within the slab and cannot be null.
+            return Some((unsafe { NonNull::new_unchecked(block) }, reuse));
         }
 
         None
@@ -608,8 +675,10 @@ impl Drop for ThreadCacheHandle {
 mod tests {
     use super::{BlockReuse, ThreadCache, ThreadCacheHandle};
     use crate::allocator::Allocator;
-    use crate::central_pool::CentralPool;
+    use crate::arena::system_page_size;
+    use crate::central_pool::SlabFreshMode;
     use crate::config::AllocatorConfig;
+    use crate::header::block_start_from_user_ptr;
     use crate::size_class::SizeClass;
     use core::ptr::NonNull;
 
@@ -628,7 +697,7 @@ mod tests {
 
     const fn test_config() -> AllocatorConfig {
         AllocatorConfig {
-            arena_size: 512,
+            arena_size: 4096,
             alignment: 64,
             refill_target_bytes: 256,
             local_cache_target_bytes: 384,
@@ -644,50 +713,77 @@ mod tests {
         Box::leak(Box::new(allocator))
     }
 
-    fn fill_central<const N: usize>(
-        pool: &CentralPool,
-        class: SizeClass,
-        blocks: &mut [TestBlock<N>],
-    ) {
-        let mut list = crate::free_list::FreeList::new();
+    fn allocate_small_blocks(
+        allocator: &Allocator,
+        cache: &mut ThreadCache,
+        count: usize,
+    ) -> Vec<NonNull<u8>> {
+        allocate_blocks_of_size(allocator, cache, count, 32)
+    }
 
-        for ptr in blocks.iter_mut().map(TestBlock::as_ptr) {
-            // SAFETY: test blocks are aligned, large enough for the intrusive node,
-            // and linked only through this temporary list.
-            unsafe {
-                list.push_block(ptr);
-            }
+    fn allocate_blocks_of_size(
+        allocator: &Allocator,
+        cache: &mut ThreadCache,
+        count: usize,
+        requested_size: usize,
+    ) -> Vec<NonNull<u8>> {
+        let mut pointers = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let ptr = allocator
+                .allocate_with_cache(cache, requested_size)
+                .unwrap_or_else(|error| panic!("expected small allocation to succeed: {error}"));
+            pointers.push(ptr);
         }
 
-        // SAFETY: the temporary list contains exactly these valid detached test blocks.
-        let batch = unsafe { list.pop_batch(blocks.len()) };
-        // SAFETY: the batch is detached and belongs to the requested class for the test.
-        unsafe {
-            pool.return_batch(class, batch);
+        pointers
+    }
+
+    fn sweepable_test_class() -> SizeClass {
+        let page_size = system_page_size();
+        SizeClass::ALL
+            .into_iter()
+            .find(|class| class.block_size() >= page_size)
+            .unwrap_or_else(|| panic!("expected at least one size class to span a full page"))
+    }
+
+    fn test_config_for_class(class: SizeClass) -> AllocatorConfig {
+        let block_size = test_config().class_block_size(class);
+        AllocatorConfig {
+            arena_size: block_size * 4,
+            alignment: test_config().alignment,
+            refill_target_bytes: block_size,
+            local_cache_target_bytes: block_size * 2,
         }
     }
 
     #[test]
     fn empty_cache_needs_refill_and_refill_moves_configured_batch() {
-        let pool = CentralPool::new();
-        let mut cache = ThreadCache::new(test_config());
-        let mut blocks = [
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-        ];
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+        let mut source = ThreadCache::new(test_config());
+        let mut destination = ThreadCache::new(test_config());
+        let pointers = allocate_small_blocks(&allocator, &mut source, 2);
 
-        fill_central(&pool, SizeClass::B64, &mut blocks);
+        for ptr in pointers {
+            // SAFETY: each pointer is still live and is freed exactly once here.
+            unsafe {
+                allocator
+                    .deallocate_with_cache(&mut source, ptr)
+                    .unwrap_or_else(|error| panic!("expected small free to succeed: {error}"));
+            }
+        }
+        allocator.drain_thread_cache_on_exit(&mut source);
 
-        assert!(cache.needs_refill(SizeClass::B64));
-
-        let moved = cache.refill_from_central(SizeClass::B64, &pool);
-
+        assert!(destination.needs_refill(SizeClass::B64));
+        let moved =
+            allocator.refill_thread_cache_from_central_for_test(&mut destination, SizeClass::B64);
         assert_eq!(moved, 2);
-        assert!(!cache.needs_refill(SizeClass::B64));
-
-        let remaining = pool.take_batch(SizeClass::B64, 8);
-        assert_eq!(remaining.len(), 1);
+        assert!(!destination.needs_refill(SizeClass::B64));
+        assert_eq!(
+            allocator.stats().small_central[SizeClass::B64.index()].blocks,
+            0
+        );
     }
 
     #[test]
@@ -719,29 +815,24 @@ mod tests {
 
     #[test]
     fn drain_excess_returns_exact_drain_batch_to_central() {
-        let pool = CentralPool::new();
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
         let mut cache = ThreadCache::new(test_config());
-        let mut blocks = [
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-        ];
+        let pointers = allocate_small_blocks(&allocator, &mut cache, 4);
 
-        for block in &mut blocks {
-            // SAFETY: each test block is detached and valid for the local free list.
+        for ptr in pointers {
+            // SAFETY: each pointer is still live and is freed exactly once here.
             unsafe {
-                cache.push(SizeClass::B64, block.as_ptr());
+                allocator
+                    .deallocate_with_cache(&mut cache, ptr)
+                    .unwrap_or_else(|error| panic!("expected small free to succeed: {error}"));
             }
         }
 
-        // SAFETY: the local cache contains only valid detached test blocks.
-        let moved = unsafe { cache.drain_excess_to_central(SizeClass::B64, &pool) };
-
-        assert_eq!(moved, 1);
-
-        let drained = pool.take_batch(SizeClass::B64, 8);
-        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            allocator.stats().small_central[SizeClass::B64.index()].blocks,
+            1
+        );
 
         let mut popped = 0;
         while cache.pop(SizeClass::B64).is_some() {
@@ -752,119 +843,193 @@ mod tests {
 
     #[test]
     fn drain_excess_is_a_noop_below_limit() {
-        let pool = CentralPool::new();
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
         let mut cache = ThreadCache::new(test_config());
-        let mut blocks = [
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-        ];
+        let pointers = allocate_small_blocks(&allocator, &mut cache, 2);
 
-        for block in &mut blocks {
-            // SAFETY: each test block is detached and valid for the local free list.
+        for ptr in pointers {
+            // SAFETY: each pointer is still live and is freed exactly once here.
             unsafe {
-                cache.push(SizeClass::B64, block.as_ptr());
+                allocator
+                    .deallocate_with_cache(&mut cache, ptr)
+                    .unwrap_or_else(|error| panic!("expected small free to succeed: {error}"));
             }
         }
 
-        // SAFETY: the local cache contains only valid detached test blocks.
-        let moved = unsafe { cache.drain_excess_to_central(SizeClass::B64, &pool) };
-
-        assert_eq!(moved, 0);
-        assert_eq!(pool.take_batch(SizeClass::B64, 8).len(), 0);
+        assert_eq!(
+            allocator.stats().small_central[SizeClass::B64.index()].blocks,
+            0
+        );
     }
 
     #[test]
     fn drain_all_moves_every_class_back_to_central() {
-        let pool = CentralPool::new();
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
         let mut cache = ThreadCache::new(test_config());
-        let mut small = [
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-        ];
-        let mut medium = [TestBlock::<{ SizeClass::B256.block_size() }>::new()];
+        let small = allocate_small_blocks(&allocator, &mut cache, 2);
+        let medium = allocator
+            .allocate_with_cache(&mut cache, 128)
+            .unwrap_or_else(|error| panic!("expected medium allocation to succeed: {error}"));
 
-        for block in &mut small {
-            // SAFETY: each test block is detached and valid for the local free list.
+        for ptr in small {
+            // SAFETY: each pointer is still live and is freed exactly once here.
             unsafe {
-                cache.push(SizeClass::B64, block.as_ptr());
+                allocator
+                    .deallocate_with_cache(&mut cache, ptr)
+                    .unwrap_or_else(|error| panic!("expected small free to succeed: {error}"));
             }
         }
-        // SAFETY: the test block is detached and valid for the local free list.
+        // SAFETY: `medium` is still live and is freed exactly once here.
         unsafe {
-            cache.push(SizeClass::B256, medium[0].as_ptr());
+            allocator
+                .deallocate_with_cache(&mut cache, medium)
+                .unwrap_or_else(|error| panic!("expected medium free to succeed: {error}"));
         }
 
-        // SAFETY: the cache contains only valid detached test blocks.
-        unsafe {
-            cache.drain_all_to_central(&pool);
-        }
+        allocator.drain_thread_cache_on_exit(&mut cache);
 
         assert!(cache.needs_refill(SizeClass::B64));
         assert!(cache.needs_refill(SizeClass::B256));
-        assert_eq!(pool.take_batch(SizeClass::B64, 8).len(), 2);
-        assert_eq!(pool.take_batch(SizeClass::B256, 8).len(), 1);
+        assert_eq!(
+            allocator.stats().small_central[SizeClass::B64.index()].blocks,
+            2
+        );
+        assert_eq!(
+            allocator.stats().small_central[SizeClass::B256.index()].blocks,
+            1
+        );
     }
 
     #[test]
     fn blocks_drained_from_one_cache_can_refill_another() {
-        let pool = CentralPool::new();
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
         let mut source = ThreadCache::new(test_config());
         let mut destination = ThreadCache::new(test_config());
-        let mut blocks = [
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-        ];
-        let expected = blocks.each_mut().map(TestBlock::as_ptr);
+        let pointers = allocate_small_blocks(&allocator, &mut source, 2);
+        let expected = pointers
+            .iter()
+            .copied()
+            .map(block_start_from_user_ptr)
+            .collect::<Vec<_>>();
 
-        for block in &mut blocks {
-            // SAFETY: each test block is detached and valid for the local free list.
+        for ptr in pointers {
+            // SAFETY: each pointer is still live and is freed exactly once here.
             unsafe {
-                source.push(SizeClass::B64, block.as_ptr());
+                allocator
+                    .deallocate_with_cache(&mut source, ptr)
+                    .unwrap_or_else(|error| panic!("expected source free to succeed: {error}"));
             }
         }
+        allocator.drain_thread_cache_on_exit(&mut source);
 
-        // SAFETY: the source cache contains only valid detached test blocks.
-        unsafe {
-            source.drain_all_to_central(&pool);
-        }
-
-        let moved = destination.refill_from_central(SizeClass::B64, &pool);
+        let moved =
+            allocator.refill_thread_cache_from_central_for_test(&mut destination, SizeClass::B64);
         assert_eq!(moved, 2);
+        let first = destination.pop(SizeClass::B64);
+        let second = destination.pop(SizeClass::B64);
+        let observed = [first, second];
 
-        assert_eq!(
-            destination.pop(SizeClass::B64),
-            Some((expected[1], BlockReuse::NeedsHeaderRewrite))
-        );
-        assert_eq!(
-            destination.pop(SizeClass::B64),
-            Some((expected[0], BlockReuse::NeedsHeaderRewrite))
-        );
+        assert!(observed.contains(&Some((expected[0], BlockReuse::NeedsHeaderRewrite))));
+        assert!(observed.contains(&Some((expected[1], BlockReuse::NeedsHeaderRewrite))));
         assert_eq!(destination.pop(SizeClass::B64), None);
     }
 
     #[test]
     fn thread_cache_handle_drop_drains_back_to_owner_central_pool() {
         let allocator = test_allocator();
-        let mut blocks = [
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-            TestBlock::<{ SizeClass::B64.block_size() }>::new(),
-        ];
 
         {
             let mut handle = ThreadCacheHandle::new(allocator);
-            handle.with_parts(|_, cache| {
-                for block in &mut blocks {
-                    // SAFETY: each test block is detached and valid for the local free list.
+            handle.with_parts(|allocator, cache| {
+                let pointers = allocate_small_blocks(allocator, cache, 2);
+                for ptr in pointers {
+                    // SAFETY: each pointer is still live and is freed exactly once here.
                     unsafe {
-                        cache.push(SizeClass::B64, block.as_ptr());
+                        allocator
+                            .deallocate_with_cache(cache, ptr)
+                            .unwrap_or_else(|error| {
+                                panic!("expected handle-owned small free to succeed: {error}")
+                            });
                     }
                 }
             });
         }
 
-        let drained = allocator.take_central_batch_for_test(SizeClass::B64, 8);
-        assert_eq!(drained.len(), 2);
+        assert_eq!(allocator.central_block_count_for_test(SizeClass::B64), 2);
+    }
+
+    #[test]
+    fn whole_slab_reissue_reuses_local_slab_record_and_marks_it_must_rewrite() {
+        let allocator = Allocator::new(test_config())
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+        let mut cache = ThreadCache::new(test_config());
+        let class = SizeClass::B64;
+        let pointers = allocate_small_blocks(&allocator, &mut cache, 2);
+
+        for ptr in pointers {
+            // SAFETY: each pointer is still live and is freed exactly once here.
+            unsafe {
+                allocator
+                    .deallocate_with_cache(&mut cache, ptr)
+                    .unwrap_or_else(|error| panic!("expected local free to succeed: {error}"));
+            }
+        }
+        allocator.drain_thread_cache_on_exit(&mut cache);
+
+        assert_eq!(cache.classes[class.index()].slabs.len(), 1);
+
+        let moved = allocator.refill_thread_cache_from_central_for_test(&mut cache, class);
+        assert_eq!(moved, 2);
+        assert_eq!(cache.classes[class.index()].slabs.len(), 1);
+        assert_eq!(
+            cache.classes[class.index()].slabs[0].fresh_mode,
+            SlabFreshMode::MustRewrite
+        );
+        assert!(matches!(
+            cache.pop(class),
+            Some((_, BlockReuse::NeedsHeaderRewrite))
+        ));
+    }
+
+    #[test]
+    fn full_cold_slab_reissue_refreshes_owner_before_cross_thread_free() {
+        let class = sweepable_test_class();
+        let config = test_config_for_class(class);
+        let request = class.payload_size();
+        let allocator = Allocator::new(config)
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+        let mut source = ThreadCache::new(config);
+        let mut destination = ThreadCache::new(config);
+        let pointers = allocate_blocks_of_size(&allocator, &mut source, 1, request);
+
+        for ptr in pointers {
+            // SAFETY: each pointer is still live and is freed exactly once here.
+            unsafe {
+                allocator
+                    .deallocate_with_cache(&mut source, ptr)
+                    .unwrap_or_else(|error| panic!("expected source free to succeed: {error}"));
+            }
+        }
+        allocator.drain_thread_cache_on_exit(&mut source);
+        assert!(allocator.force_first_full_hot_slab_to_cold_for_test(class));
+
+        let reused = allocator
+            .allocate_with_cache(&mut destination, request)
+            .unwrap_or_else(|error| panic!("expected full-cold slab reissue allocation: {error}"));
+
+        // SAFETY: `reused` is live and freeing through the old owner cache should route
+        // remotely only if the reissued header owner cache id was refreshed correctly.
+        unsafe {
+            allocator
+                .deallocate_with_cache(&mut source, reused)
+                .unwrap_or_else(|error| panic!("expected cross-thread free to succeed: {error}"));
+        }
+
+        assert_eq!(source.stats().total_local_blocks(), 0);
+        assert_eq!(allocator.stats().small_central[class.index()].blocks, 1);
     }
 
     #[test]

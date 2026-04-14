@@ -1,5 +1,6 @@
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::io;
 
 use memmap2::MmapMut;
 
@@ -208,6 +209,91 @@ impl Arena {
     }
 }
 
+static SYSTEM_PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static ADVISE_FREE_OVERRIDE: core::sync::atomic::AtomicIsize =
+    core::sync::atomic::AtomicIsize::new(-1);
+
+#[must_use]
+pub(crate) fn system_page_size() -> usize {
+    let cached = SYSTEM_PAGE_SIZE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+
+    let detected = detect_system_page_size().unwrap_or(4096);
+    SYSTEM_PAGE_SIZE.store(detected, Ordering::Relaxed);
+    detected
+}
+
+#[must_use]
+pub(crate) fn page_aligned_inner_range(start: NonNull<u8>, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+
+    let page_size = system_page_size();
+    let start_addr = start.as_ptr().addr();
+    let end_addr = start_addr.checked_add(len)?;
+    let aligned_start = align_up(start_addr, page_size)?;
+    let aligned_end = align_down(end_addr, page_size);
+
+    if aligned_start >= aligned_end {
+        return None;
+    }
+
+    Some((aligned_start, aligned_end - aligned_start))
+}
+
+/// Advises the operating system that the page-aligned arena range may be reclaimed lazily.
+///
+/// Returns `Ok(true)` when the advisory syscall ran successfully, `Ok(false)` on
+/// unsupported targets or for empty ranges, and `Err` when the syscall itself failed.
+///
+/// # Safety
+///
+/// `addr..addr + len` must describe a valid mapped page-aligned range inside the arena.
+pub(crate) unsafe fn advise_free(addr: usize, len: usize) -> io::Result<bool> {
+    if len == 0 {
+        return Ok(false);
+    }
+
+    #[cfg(test)]
+    match ADVISE_FREE_OVERRIDE.load(Ordering::Relaxed) {
+        -1 => {}
+        0 => return Ok(false),
+        1 => return Ok(true),
+        other => unreachable!("unexpected advise_free override mode: {other}"),
+    }
+
+    // SAFETY: the caller guarantees `addr..addr + len` is a valid page-aligned mapping.
+    unsafe { advise_free_impl(addr, len) }
+}
+
+#[cfg(test)]
+pub(crate) struct AdviseFreeOverrideGuard {
+    previous: isize,
+}
+
+#[cfg(test)]
+impl Drop for AdviseFreeOverrideGuard {
+    fn drop(&mut self) {
+        ADVISE_FREE_OVERRIDE.store(self.previous, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn override_advise_free_for_test(result: Option<bool>) -> AdviseFreeOverrideGuard {
+    let next = match result {
+        None => -1,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
+    let previous = ADVISE_FREE_OVERRIDE.swap(next, Ordering::Relaxed);
+
+    AdviseFreeOverrideGuard { previous }
+}
+
 impl ReservedSpan {
     #[must_use]
     pub(crate) const fn start(&self) -> NonNull<u8> {
@@ -218,6 +304,38 @@ impl ReservedSpan {
     pub(crate) const fn size(&self) -> usize {
         self.size
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn detect_system_page_size() -> Option<usize> {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` is a thread-safe libc query with no pointer arguments.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page_size)
+        .ok()
+        .filter(|size| size.is_power_of_two())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const fn detect_system_page_size() -> Option<usize> {
+    Some(4096)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+unsafe fn advise_free_impl(addr: usize, len: usize) -> io::Result<bool> {
+    let ptr = addr as *mut libc::c_void;
+    // SAFETY: the caller guarantees that this range is page-aligned mapped memory that
+    // remains valid for the duration of the advisory syscall.
+    let status = unsafe { libc::madvise(ptr, len, libc::MADV_FREE) };
+    if status == 0 {
+        Ok(true)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+unsafe fn advise_free_impl(_addr: usize, _len: usize) -> io::Result<bool> {
+    Ok(false)
 }
 
 const fn validate_config(config: &AllocatorConfig) -> Result<(), InitError> {
@@ -249,5 +367,71 @@ const fn align_up(value: usize, alignment: usize) -> Option<usize> {
         Some(value)
     } else {
         value.checked_add(alignment - remainder)
+    }
+}
+
+const fn align_down(value: usize, alignment: usize) -> usize {
+    value - (value % alignment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{advise_free, page_aligned_inner_range, system_page_size};
+    use core::ptr::NonNull;
+    use memmap2::MmapMut;
+
+    #[test]
+    fn system_page_size_is_positive_power_of_two() {
+        let page_size = system_page_size();
+
+        assert!(page_size > 0);
+        assert!(page_size.is_power_of_two());
+    }
+
+    #[test]
+    fn inner_range_excludes_partial_pages() {
+        let page_size = system_page_size();
+        let mut mapping = MmapMut::map_anon(page_size * 4)
+            .unwrap_or_else(|error| panic!("expected anonymous mapping: {error}"));
+        let base = NonNull::new(mapping.as_mut_ptr())
+            .unwrap_or_else(|| panic!("expected non-null mapping base"));
+        let start = base.as_ptr().wrapping_add(page_size / 2);
+        let start = NonNull::new(start).unwrap_or_else(|| panic!("expected non-null start"));
+
+        let inner = page_aligned_inner_range(start, page_size * 2)
+            .unwrap_or_else(|| panic!("expected fully contained page range"));
+
+        assert_eq!(inner.0, base.as_ptr().addr() + page_size);
+        assert_eq!(inner.1, page_size);
+    }
+
+    #[test]
+    fn inner_range_is_none_when_span_has_no_full_page() {
+        let page_size = system_page_size();
+        let mut mapping = MmapMut::map_anon(page_size * 2)
+            .unwrap_or_else(|error| panic!("expected anonymous mapping: {error}"));
+        let start = mapping.as_mut_ptr().wrapping_add(page_size / 2);
+        let start = NonNull::new(start).unwrap_or_else(|| panic!("expected non-null start"));
+
+        assert_eq!(page_aligned_inner_range(start, page_size - 1), None);
+    }
+
+    #[test]
+    fn advise_free_is_supported_or_noop_for_mapped_memory() {
+        let page_size = system_page_size();
+        let mut mapping = MmapMut::map_anon(page_size * 3)
+            .unwrap_or_else(|error| panic!("expected anonymous mapping: {error}"));
+        let base = NonNull::new(mapping.as_mut_ptr())
+            .unwrap_or_else(|| panic!("expected non-null mapping base"));
+        let middle_page = base.as_ptr().wrapping_add(page_size).addr();
+
+        // SAFETY: the chosen subrange is page-aligned and fully contained in the mapping.
+        let advised = unsafe { advise_free(middle_page, page_size) }
+            .unwrap_or_else(|error| panic!("expected advise_free result: {error}"));
+
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert!(advised);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        assert!(!advised);
     }
 }

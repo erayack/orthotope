@@ -69,6 +69,8 @@ system-fallback allocations.
 - small allocations use thread-local reuse first, then central-pool refill, then arena carving
 - each thread cache owns class-local slabs carved from contiguous arena spans
 - small-cache arena refill reserves one contiguous span, registers it as a local slab, and splits it into class-sized blocks
+- fully central-resident small slabs may be retained as metadata-only central records and
+  lazily marked reclaimable with `madvise(MADV_FREE)` when they stay cold
 - frees are routed by a 64-byte allocation header
 - small-allocation headers are refreshed in place on reuse instead of rebuilding a fresh header object
 - requests above `16 MiB` use the large-allocation path
@@ -79,6 +81,10 @@ system-fallback allocations.
   same-size or smaller large requests, using smallest-fitting reuse first
 - rebinding an empty caller-owned `ThreadCache` to another allocator clears stale
   local slab metadata before the new allocator starts carving fresh slabs
+
+`AllocatorStats::arena_remaining` reports monotonic unreserved arena capacity, not RSS.
+Pages from fully idle central slabs may remain in the arena address space even after they
+become lazily reclaimable.
 
 Small-object provenance in v1 is limited to header validation plus an arena-range
 ownership check on the decoded block start. Foreign pointers are rejected where

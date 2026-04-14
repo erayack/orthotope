@@ -58,13 +58,15 @@ pub(crate) fn try_with_thread_cache<R>(
 ) -> Result<Option<R>, &'static InitError> {
     let allocator = global_allocator()?;
 
-    THREAD_CACHE.with(|cache| {
-        let Ok(mut handle) = cache.try_borrow_mut() else {
-            return Ok(None);
-        };
-        let handle = handle.get_or_insert_with(|| ThreadCacheHandle::new(allocator));
-        Ok(Some(handle.with_parts(f)))
-    })
+    THREAD_CACHE
+        .try_with(|cache| {
+            let Ok(mut handle) = cache.try_borrow_mut() else {
+                return Ok(None);
+            };
+            let handle = handle.get_or_insert_with(|| ThreadCacheHandle::new(allocator));
+            Ok(Some(handle.with_parts(f)))
+        })
+        .unwrap_or(Ok(None))
 }
 
 pub use crate::allocator::Allocator;

@@ -2,11 +2,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arena::Arena;
-use crate::central_pool::CentralPool;
+use crate::central_pool::{CentralPool, SlabFreshMode};
 use crate::config::AllocatorConfig;
 use crate::error::{AllocError, FreeError, InitError};
-#[cfg(test)]
-use crate::free_list::Batch;
 use crate::header::{
     AllocationHeader, AllocationKind, HEADER_ALIGNMENT, HEADER_SIZE, block_start_from_user_ptr,
     user_ptr_from_block_start,
@@ -80,8 +78,22 @@ impl Allocator {
     }
 
     #[cfg(test)]
-    pub(crate) fn take_central_batch_for_test(&self, class: SizeClass, max: usize) -> Batch {
-        self.central.take_batch(class, max)
+    pub(crate) fn central_block_count_for_test(&self, class: SizeClass) -> usize {
+        self.central.block_counts()[class.index()]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refill_thread_cache_from_central_for_test(
+        &self,
+        cache: &mut ThreadCache,
+        class: SizeClass,
+    ) -> usize {
+        cache.refill_from_central(class, &self.central)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_first_full_hot_slab_to_cold_for_test(&self, class: SizeClass) -> bool {
+        self.central.force_first_full_hot_to_cold_for_test(class)
     }
 
     #[must_use]
@@ -275,8 +287,16 @@ impl Allocator {
 
         let carved = span.size() / block_size;
         initialize_small_span_headers(span.start(), block_size, carved, class)?;
+        self.central
+            .register_slab(class, span.start(), block_size, carved);
 
-        cache.push_owned_slab(class, span.start(), block_size, carved);
+        cache.push_owned_slab(
+            class,
+            span.start(),
+            block_size,
+            carved,
+            SlabFreshMode::Preinitialized,
+        );
 
         Ok(carved)
     }
