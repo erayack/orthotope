@@ -1,23 +1,22 @@
-use core::mem::size_of;
 use core::ptr::NonNull;
 
-#[repr(C)]
-struct FreeBlock {
-    next: Option<NonNull<Self>>,
-}
+use crate::header::{read_small_free_list_next, write_small_free_list_next};
+
+// The reserved free-list link word lives in the allocation header. Its offset, size,
+// and alignment are asserted in `src/header.rs`.
 
 #[allow(dead_code)]
 /// Intrusive LIFO list of detached allocator blocks.
 pub(crate) struct FreeList {
-    head: Option<NonNull<FreeBlock>>,
+    head: Option<NonNull<u8>>,
     len: usize,
 }
 
 #[allow(dead_code)]
 /// Detached block chain used for O(1) transfers between lists.
 pub(crate) struct Batch {
-    head: Option<NonNull<FreeBlock>>,
-    tail: Option<NonNull<FreeBlock>>,
+    head: Option<NonNull<u8>>,
+    tail: Option<NonNull<u8>>,
     len: usize,
 }
 
@@ -55,14 +54,14 @@ impl FreeList {
     /// # Safety
     ///
     /// `block` must be the start of a valid allocator block, properly aligned,
-    /// large enough to hold a `FreeBlock`, and not currently linked in any free list.
+    /// and not currently linked in any free list.
     #[allow(clippy::missing_const_for_fn)]
     pub(crate) unsafe fn push_block(&mut self, block: NonNull<u8>) {
-        let mut block = block.cast::<FreeBlock>();
         // SAFETY: the caller guarantees that `block` points to writable storage large
-        // enough for `FreeBlock` and that it is not currently linked elsewhere.
+        // enough for the reserved small-block link word and that it is not currently
+        // linked elsewhere.
         unsafe {
-            block.as_mut().next = self.head;
+            write_small_free_list_next(block, self.head);
         }
         self.head = Some(block);
         self.len += 1;
@@ -73,21 +72,22 @@ impl FreeList {
     /// # Safety
     ///
     /// Every node currently linked in the list must point to writable storage large
-    /// enough for `FreeBlock` and must belong exclusively to this list.
+    /// enough for the reserved small-block link word and must belong exclusively to
+    /// this list.
     #[must_use]
     pub(crate) unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
-        let mut head = self.head?;
+        let head = self.head?;
         // SAFETY: `head` is a node already linked in this list, so reading its next
         // pointer is valid under the list invariants.
-        let next = unsafe { head.as_ref().next };
+        let next = unsafe { read_small_free_list_next(head) };
         self.head = next;
         self.len -= 1;
         // SAFETY: `head` has been detached from the list, so clearing the next pointer
         // maintains the invariant that detached nodes are single-block chains.
         unsafe {
-            head.as_mut().next = None;
+            write_small_free_list_next(head, None);
         }
-        Some(head.cast())
+        Some(head)
     }
 
     /// Prepends a detached batch to this list while preserving batch order.
@@ -95,7 +95,8 @@ impl FreeList {
     /// # Safety
     ///
     /// `batch` must describe a valid detached chain whose nodes are not linked in any
-    /// other free list and whose storage is large enough for `FreeBlock`.
+    /// other free list and whose storage is large enough for the reserved small-block
+    /// link word.
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) unsafe fn push_batch(&mut self, batch: Batch) {
         let Batch { head, tail, len } = batch;
@@ -104,12 +105,12 @@ impl FreeList {
         }
 
         let head = head.unwrap_or_else(|| unreachable!("non-empty batch must have a head"));
-        let mut tail = tail.unwrap_or_else(|| unreachable!("non-empty batch must have a tail"));
+        let tail = tail.unwrap_or_else(|| unreachable!("non-empty batch must have a tail"));
 
         // SAFETY: `tail` is the last node in the detached batch, so wiring it to this
         // list head splices the entire batch in front without disturbing batch order.
         unsafe {
-            tail.as_mut().next = self.head;
+            write_small_free_list_next(tail, self.head);
         }
         self.head = Some(head);
         self.len += len;
@@ -120,7 +121,8 @@ impl FreeList {
     /// # Safety
     ///
     /// Every node currently linked in the list must point to writable storage large
-    /// enough for `FreeBlock` and must belong exclusively to this list.
+    /// enough for the reserved small-block link word and must belong exclusively to
+    /// this list.
     #[must_use]
     pub(crate) unsafe fn pop_batch(&mut self, max: usize) -> Batch {
         if max == 0 || self.is_empty() {
@@ -136,20 +138,19 @@ impl FreeList {
         for _ in 1..take {
             // SAFETY: we only walk within the first `take` nodes of a valid list.
             tail = unsafe {
-                tail.as_ref()
-                    .next
+                read_small_free_list_next(tail)
                     .unwrap_or_else(|| unreachable!("free list shorter than recorded length"))
             };
         }
 
         // SAFETY: `tail` is the last node to detach, so taking its next pointer splits
         // the list into a detached batch and the remaining suffix.
-        let remainder = unsafe { tail.as_ref().next };
+        let remainder = unsafe { read_small_free_list_next(tail) };
         self.head = remainder;
         // SAFETY: `tail` is detached from the remaining list, so terminating the batch
         // with `None` preserves a valid detached chain.
         unsafe {
-            tail.as_mut().next = None;
+            write_small_free_list_next(tail, None);
         }
         self.len -= take;
 
@@ -186,11 +187,11 @@ impl Batch {
     }
 }
 
-const _: [(); size_of::<FreeBlock>()] = [(); size_of::<Option<NonNull<FreeBlock>>>()];
-
 #[cfg(test)]
 mod tests {
     use super::{Batch, FreeList};
+    use crate::header::{AllocationHeader, header_from_block_start};
+    use crate::size_class::SizeClass;
     use core::ptr::NonNull;
 
     #[repr(align(64))]
@@ -206,14 +207,33 @@ mod tests {
         }
     }
 
+    fn initialize_test_header(block: &mut TestBlock, requested_size: usize, owner_cache_id: u32) {
+        let block_start = block.as_ptr();
+        // These test blocks only provide header-sized storage. That is enough because
+        // `FreeList` touches only the reserved header words, and this helper stamps a
+        // valid small-header prefix so tests can verify those reserved words do not
+        // clobber the semantic routing fields.
+        AllocationHeader::write_small_to_block(
+            block_start,
+            SizeClass::B64,
+            requested_size,
+            owner_cache_id,
+        )
+        .unwrap_or_else(|| panic!("expected test header initialization to succeed"));
+    }
+
     #[test]
     fn push_and_pop_are_lifo() {
         let mut list = FreeList::new();
         let mut blocks = [TestBlock::new(), TestBlock::new(), TestBlock::new()];
+        initialize_test_header(&mut blocks[0], 8, 11);
+        initialize_test_header(&mut blocks[1], 16, 12);
+        initialize_test_header(&mut blocks[2], 24, 13);
         let ptrs = blocks.each_mut().map(TestBlock::as_ptr);
 
-        // SAFETY: test blocks are aligned, large enough for a `FreeBlock`, and linked
-        // only through this list for the duration of the test.
+        // SAFETY: test blocks are aligned, provide initialized header storage with the
+        // reserved free-list metadata words, and are linked only through this list for
+        // the duration of the test.
         unsafe {
             list.push_block(ptrs[0]);
             list.push_block(ptrs[1]);
@@ -256,9 +276,14 @@ mod tests {
             TestBlock::new(),
             TestBlock::new(),
         ];
+        initialize_test_header(&mut blocks[0], 8, 21);
+        initialize_test_header(&mut blocks[1], 16, 22);
+        initialize_test_header(&mut blocks[2], 24, 23);
+        initialize_test_header(&mut blocks[3], 32, 24);
         let ptrs = blocks.each_mut().map(TestBlock::as_ptr);
 
-        // SAFETY: test blocks are aligned, large enough for a `FreeBlock`, and owned by this list.
+        // SAFETY: test blocks are aligned, provide initialized header storage with the
+        // reserved free-list metadata words, and are owned by this list.
         unsafe {
             list.push_block(ptrs[0]);
             list.push_block(ptrs[1]);
@@ -302,10 +327,16 @@ mod tests {
             TestBlock::new(),
             TestBlock::new(),
         ];
+        initialize_test_header(&mut blocks[0], 8, 31);
+        initialize_test_header(&mut blocks[1], 16, 32);
+        initialize_test_header(&mut blocks[2], 24, 33);
+        initialize_test_header(&mut blocks[3], 32, 34);
+        initialize_test_header(&mut blocks[4], 40, 35);
         let ptrs = blocks.each_mut().map(TestBlock::as_ptr);
 
-        // SAFETY: test blocks are aligned, large enough for a `FreeBlock`, and each block
-        // is linked into at most one list at a time in this test.
+        // SAFETY: test blocks are aligned, provide initialized header storage with the
+        // reserved free-list metadata words, and each block is linked into at most one
+        // list at a time in this test.
         unsafe {
             source.push_block(ptrs[0]);
             source.push_block(ptrs[1]);
@@ -340,10 +371,12 @@ mod tests {
     fn zero_length_and_empty_batches_are_noops() {
         let mut list = FreeList::new();
         let mut block = TestBlock::new();
+        initialize_test_header(&mut block, 8, 41);
         let ptr = block.as_ptr();
 
-        // SAFETY: the test block is aligned, large enough for a `FreeBlock`, and linked
-        // only through this list for the duration of the test.
+        // SAFETY: the test block is aligned, provides initialized header storage with the
+        // reserved free-list metadata words, and is linked only through this list for
+        // the duration of the test.
         unsafe {
             list.push_block(ptr);
         }
@@ -364,5 +397,46 @@ mod tests {
             assert_eq!(list.pop_block(), Some(ptr));
             assert_eq!(list.pop_block(), None);
         }
+    }
+
+    #[test]
+    fn push_and_pop_preserve_semantic_header_fields() {
+        let mut list = FreeList::new();
+        let mut block = TestBlock::new();
+        initialize_test_header(&mut block, 48, 77);
+        let ptr = block.as_ptr();
+        // SAFETY: `ptr` names the start of the test block's initialized header storage.
+        let before = unsafe { header_from_block_start(ptr).as_ref() };
+        let expected_requested = before.requested_size();
+        let expected_usable = before.usable_size();
+        let expected_owner = before.small_owner_cache_id();
+
+        // SAFETY: the test block is linked only through `list` for this check.
+        unsafe {
+            list.push_block(ptr);
+        }
+        // SAFETY: `ptr` still names the same initialized header after the reserved link word changes.
+        let during = unsafe { header_from_block_start(ptr).as_ref() };
+        assert_eq!(
+            during.validate(),
+            Ok(crate::header::AllocationKind::Small(SizeClass::B64))
+        );
+        assert_eq!(during.requested_size(), expected_requested);
+        assert_eq!(during.usable_size(), expected_usable);
+        assert_eq!(during.small_owner_cache_id(), expected_owner);
+
+        // SAFETY: the list contains exactly the single test block.
+        unsafe {
+            assert_eq!(list.pop_block(), Some(ptr));
+        }
+        // SAFETY: popping the block detaches it but leaves its initialized header storage intact.
+        let after = unsafe { header_from_block_start(ptr).as_ref() };
+        assert_eq!(
+            after.validate(),
+            Ok(crate::header::AllocationKind::Small(SizeClass::B64))
+        );
+        assert_eq!(after.requested_size(), expected_requested);
+        assert_eq!(after.usable_size(), expected_usable);
+        assert_eq!(after.small_owner_cache_id(), expected_owner);
     }
 }

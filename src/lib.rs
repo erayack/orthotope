@@ -6,8 +6,9 @@
 //! direct instance-oriented use. Downstream binaries may also opt in to a
 //! `#[global_allocator]` adapter via [`OrthotopeGlobalAlloc`].
 //!
-//! Only free live pointers returned by Orthotope. Small-object double free remains
-//! undefined behavior, and same-arena pointer forgery is not guaranteed to be detected.
+//! Only free live pointers returned by Orthotope. Debug builds detect some small-object
+//! double frees, but same-arena pointer forgery and stale-pointer ABA cases are still
+//! outside the allocator's guaranteed provenance boundary.
 
 use std::cell::RefCell;
 use std::sync::LazyLock;

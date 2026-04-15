@@ -1,6 +1,6 @@
 //! Allocation-header layout and pointer conversions used for deallocation routing.
 
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 use core::ptr::NonNull;
 use core::ptr::{self};
 
@@ -14,6 +14,13 @@ pub const HEADER_SIZE: usize = 64;
 
 const HEADER_MAGIC: u32 = 0x4f52_5448;
 const LARGE_CLASS_SENTINEL: u8 = u8::MAX;
+const SMALL_FREE_MARKER_SEED: usize = usize::MAX ^ (HEADER_MAGIC as usize);
+const HEADER_SCRATCH_RESERVED_SIZE: usize = size_of::<u32>();
+const HEADER_TAIL_PADDING_SIZE: usize = HEADER_SIZE
+    - size_of::<AllocationHeaderPrefix>()
+    - HEADER_SCRATCH_RESERVED_SIZE
+    - size_of::<usize>()
+    - size_of::<usize>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -54,7 +61,12 @@ pub(crate) struct AllocationHeader {
     requested_size: u32,
     usable_size: u32,
     owner_cache_id: u32,
-    padding: [u8; 44],
+    // Explicitly occupies the 4-byte gap that keeps the reserved free-list words
+    // pointer-aligned within the first cache line on 64-bit targets.
+    free_metadata_alignment_padding: u32,
+    free_list_link: usize,
+    small_free_marker: usize,
+    tail_padding: [u8; HEADER_TAIL_PADDING_SIZE],
 }
 
 impl AllocationHeader {
@@ -198,9 +210,10 @@ impl AllocationHeader {
         // SAFETY: `header_ptr` names the 64-byte header region at the start of a valid
         // allocator block. Fresh slab entries keep a non-live requested-size marker so
         // untouched blocks are not accepted by deallocation before first allocation.
+        // `write_small_prefix` routes through `write_encoded_fields`, which also clears
+        // the reserved free-list metadata words and tail padding for the fresh block.
         unsafe {
             Self::write_small_prefix(header_ptr, class_index, 0, usable_size);
-            ptr::addr_of_mut!((*header_ptr.as_ptr()).padding).write([0; 44]);
         }
 
         Some(header_ptr)
@@ -286,7 +299,10 @@ impl AllocationHeader {
             requested_size,
             usable_size,
             owner_cache_id,
-            padding: [0; 44],
+            free_metadata_alignment_padding: 0,
+            free_list_link: 0,
+            small_free_marker: 0,
+            tail_padding: [0; HEADER_TAIL_PADDING_SIZE],
         }
     }
 
@@ -309,6 +325,10 @@ impl AllocationHeader {
             ptr::addr_of_mut!((*header).requested_size).write(requested_size);
             ptr::addr_of_mut!((*header).usable_size).write(usable_size);
             ptr::addr_of_mut!((*header).owner_cache_id).write(owner_cache_id);
+            ptr::addr_of_mut!((*header).free_metadata_alignment_padding).write(0);
+            ptr::addr_of_mut!((*header).free_list_link).write(0);
+            ptr::addr_of_mut!((*header).small_free_marker).write(0);
+            ptr::addr_of_mut!((*header).tail_padding).write([0; HEADER_TAIL_PADDING_SIZE]);
         }
     }
 
@@ -458,6 +478,85 @@ pub(crate) const fn block_start_from_user_ptr(user_ptr: NonNull<u8>) -> NonNull<
     header_from_user_ptr(user_ptr).cast()
 }
 
+pub(crate) const SMALL_FREE_LIST_LINK_OFFSET: usize = offset_of!(AllocationHeader, free_list_link);
+pub(crate) const SMALL_FREE_MARKER_OFFSET: usize = offset_of!(AllocationHeader, small_free_marker);
+
+pub(crate) unsafe fn read_small_free_list_next(block_start: NonNull<u8>) -> Option<NonNull<u8>> {
+    let header = header_from_block_start(block_start).as_ptr();
+    // SAFETY: `block_start` names readable header storage for an allocator block, and the
+    // free-list link word is reserved exclusively for detached small-block linkage.
+    let next_addr = unsafe { ptr::addr_of!((*header).free_list_link).read() };
+    NonNull::new(next_addr as *mut u8)
+}
+
+pub(crate) unsafe fn write_small_free_list_next(
+    block_start: NonNull<u8>,
+    next: Option<NonNull<u8>>,
+) {
+    let header = header_from_block_start(block_start).as_ptr();
+    let next_addr = next.map_or(0, |ptr| ptr.as_ptr().addr());
+    // SAFETY: `block_start` names writable header storage for an allocator block, and the
+    // free-list link word is reserved exclusively for detached small-block linkage.
+    unsafe {
+        ptr::addr_of_mut!((*header).free_list_link).write(next_addr);
+    }
+}
+
+pub(crate) unsafe fn clear_small_free_metadata(block_start: NonNull<u8>) {
+    // SAFETY: the caller ensures this block has been detached from any free list before its
+    // free-list metadata is reset for live allocation use.
+    unsafe {
+        write_small_free_list_next(block_start, None);
+        clear_small_block_freed(block_start);
+    }
+}
+
+#[cfg(debug_assertions)]
+fn small_free_marker_for(block_start: NonNull<u8>) -> usize {
+    SMALL_FREE_MARKER_SEED ^ block_start.as_ptr().addr().rotate_left(17) ^ HEADER_SIZE
+}
+
+#[cfg(debug_assertions)]
+pub(crate) unsafe fn small_block_is_marked_freed(block_start: NonNull<u8>) -> bool {
+    let header = header_from_block_start(block_start).as_ptr();
+    // SAFETY: `block_start` names readable header storage for an allocator block whose
+    // freed marker lives in a reserved header word.
+    unsafe {
+        ptr::addr_of!((*header).small_free_marker).read() == small_free_marker_for(block_start)
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) const fn small_block_is_marked_freed(_block_start: NonNull<u8>) -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+pub(crate) unsafe fn mark_small_block_freed(block_start: NonNull<u8>) {
+    let header = header_from_block_start(block_start).as_ptr();
+    // SAFETY: `block_start` names writable header storage for an allocator block whose
+    // freed marker lives in a reserved header word.
+    unsafe {
+        ptr::addr_of_mut!((*header).small_free_marker).write(small_free_marker_for(block_start));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) const fn mark_small_block_freed(_block_start: NonNull<u8>) {}
+
+#[cfg(debug_assertions)]
+pub(crate) unsafe fn clear_small_block_freed(block_start: NonNull<u8>) {
+    let header = header_from_block_start(block_start).as_ptr();
+    // SAFETY: `block_start` names writable header storage for an allocator block whose
+    // freed marker lives in a reserved header word.
+    unsafe {
+        ptr::addr_of_mut!((*header).small_free_marker).write(0);
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) const fn clear_small_block_freed(_block_start: NonNull<u8>) {}
+
 #[must_use]
 const fn size_class_to_index(class: SizeClass) -> u8 {
     match class {
@@ -498,6 +597,10 @@ const fn index_to_size_class(index: u8) -> Option<SizeClass> {
 const _: [(); HEADER_SIZE] = [(); size_of::<AllocationHeader>()];
 const _: [(); HEADER_ALIGNMENT] = [(); align_of::<AllocationHeader>()];
 const _: [(); AllocationHeader::PREFIX_SIZE] = [(); size_of::<AllocationHeaderPrefix>()];
+const _: [(); 1] = [(); (SMALL_FREE_LIST_LINK_OFFSET + size_of::<usize>() <= HEADER_SIZE) as usize];
+const _: [(); 1] = [(); (SMALL_FREE_MARKER_OFFSET + size_of::<usize>() <= HEADER_SIZE) as usize];
+const _: [(); 1] = [(); SMALL_FREE_LIST_LINK_OFFSET.is_multiple_of(align_of::<usize>()) as usize];
+const _: [(); 1] = [(); SMALL_FREE_MARKER_OFFSET.is_multiple_of(align_of::<usize>()) as usize];
 
 #[cfg(test)]
 mod tests {

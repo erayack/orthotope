@@ -40,6 +40,9 @@ pub enum FreeError {
     /// The compatibility size argument disagreed with the stored allocation size.
     #[error("provided size {provided} does not match recorded allocation size {recorded}")]
     SizeMismatch { provided: usize, recorded: usize },
+    /// A small allocation was freed twice while its freed marker was still intact.
+    #[error("small allocation was already freed")]
+    DoubleFree,
     /// A large allocation was already freed or was never recorded as live.
     #[error("large allocation was already freed or is unknown")]
     AlreadyFreedOrUnknownLarge,

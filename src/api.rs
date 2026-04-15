@@ -36,14 +36,16 @@ pub fn allocate(size: usize) -> Result<NonNull<u8>, AllocError> {
 ///
 /// Returns [`FreeError::CorruptHeader`] when the allocation metadata cannot be decoded,
 /// [`FreeError::ForeignPointer`] when a decoded small block falls outside the current
-/// allocator's arena-range ownership boundary, and
+/// allocator's arena-range ownership boundary, [`FreeError::DoubleFree`] for duplicate
+/// small frees detected while the freed marker is still intact in debug builds, and
 /// [`FreeError::AlreadyFreedOrUnknownLarge`] for unknown large frees.
 ///
 /// Small-object provenance in v1 is limited to header validation plus that
-/// arena-range/alignment check. Same-arena forgery, small double-free, and stale large
-/// pointers after address reuse remain outside guaranteed detection, so violating the
-/// safety contract can still be UB even when an error is returned for some invalid
-/// pointers.
+/// arena-range/alignment check plus a debug-build freed marker. Same-arena forgery,
+/// stale large pointers after address reuse, cold-page reclaim that discards freed
+/// markers, and stale-pointer ABA cases remain outside guaranteed detection, so
+/// violating the safety contract can still be UB even when an error is returned for
+/// some invalid pointers.
 pub unsafe fn deallocate(ptr: NonNull<u8>) -> Result<(), FreeError> {
     try_with_thread_cache(|allocator, cache| {
         // SAFETY: the caller guarantees that `ptr` is a live allocation from this

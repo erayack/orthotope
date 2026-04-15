@@ -4,6 +4,8 @@
 [![Documentation](https://docs.rs/orthotope/badge.svg)](https://docs.rs/orthotope)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+See [`CHANGELOG`](CHANGELOG.md) for release-specific compatibility notes.
+
 Orthotope is a Rust allocator library with:
 
 - a pre-mapped arena
@@ -39,7 +41,8 @@ unsafe {
 - `deallocate_with_size(ptr, size)` validates the recorded size before freeing
 - `global_stats()` returns a best-effort snapshot of the global allocator's shared state
 
-Only free live pointers returned by Orthotope. Small-object double free remains undefined behavior.
+Only free live pointers returned by Orthotope. Debug builds detect some small-object
+double frees, but stale-pointer ABA cases remain outside guaranteed detection.
 
 For direct instance-oriented use, the crate also exposes `Allocator`, `AllocatorConfig`,
 `ThreadCache`, and `SizeClass` at the crate root. Use one `ThreadCache` per thread when
@@ -87,9 +90,10 @@ Pages from fully idle central slabs may remain in the arena address space even a
 become lazily reclaimable.
 
 Small-object provenance in v1 is limited to header validation plus an arena-range
-ownership check on the decoded block start. Foreign pointers are rejected where
-detectable, but small-object double free remains undefined behavior and same-arena
-pointer forgery is not guaranteed to be detected.
+ownership check on the decoded block start, with debug-build freed-marker detection
+for duplicate small frees while the marker survives in cached memory. Foreign pointers
+are rejected where detectable, but same-arena pointer forgery, stale-pointer ABA, and
+cold-page reclaim that discards freed markers are not guaranteed to be detected.
 
 Large allocations are also tracked in a live registry. Duplicate large frees are rejected
 when the pointer still decodes to a valid large-allocation header for the same live

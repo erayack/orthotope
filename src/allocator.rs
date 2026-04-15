@@ -7,6 +7,7 @@ use crate::config::AllocatorConfig;
 use crate::error::{AllocError, FreeError, InitError};
 use crate::header::{
     AllocationHeader, AllocationKind, HEADER_ALIGNMENT, HEADER_SIZE, block_start_from_user_ptr,
+    clear_small_free_metadata, mark_small_block_freed, small_block_is_marked_freed,
     user_ptr_from_block_start,
 };
 use crate::large_object::LargeObjectAllocator;
@@ -167,9 +168,11 @@ impl Allocator {
     /// [`FreeError::AlreadyFreedOrUnknownLarge`] for unknown large frees.
     ///
     /// Small-object provenance in v1 is limited to header validation plus an
-    /// arena-range/alignment check on the decoded block start. This intentionally
-    /// does not promise full same-arena forgery, duplicate-free detection for small
-    /// allocations, or stale large-pointer detection after address reuse.
+    /// arena-range/alignment check on the decoded block start, with debug-build
+    /// duplicate-free detection while a freed marker remains intact. This intentionally
+    /// does not promise full same-arena forgery detection, ABA-safe stale-pointer
+    /// detection for small allocations, or stale large-pointer detection after
+    /// address reuse.
     pub unsafe fn deallocate_with_cache(
         &self,
         cache: &mut ThreadCache,
@@ -196,7 +199,8 @@ impl Allocator {
     /// recorded header size, plus the same errors as [`Self::deallocate_with_cache`].
     ///
     /// The additional size check does not strengthen small-object provenance beyond
-    /// the v1 header-plus-arena-range ownership check.
+    /// the v1 header-plus-arena-range ownership check plus debug-build duplicate-free
+    /// detection.
     pub unsafe fn deallocate_with_size_checked(
         &self,
         cache: &mut ThreadCache,
@@ -233,6 +237,12 @@ impl Allocator {
             requested: requested_size,
             remaining: self.arena.remaining(),
         })?;
+
+        // SAFETY: `block_start` has been detached from every free-list structure before
+        // reaching this allocation path, so its reserved free-list metadata can be reset.
+        unsafe {
+            clear_small_free_metadata(block_start);
+        }
 
         match reuse {
             BlockReuse::HotReuseRequestedOnly => {
@@ -366,16 +376,6 @@ impl Allocator {
         // from this allocator, so decoding its header is the required validation step.
         let (header, kind) = unsafe { Self::decode_header(user_ptr)? };
 
-        if let Some(expected_size) = expected_size {
-            let recorded = header.requested_size();
-            if expected_size != recorded {
-                return Err(FreeError::SizeMismatch {
-                    provided: expected_size,
-                    recorded,
-                });
-            }
-        }
-
         match kind {
             AllocationKind::Small(class) => {
                 let block_start = block_start_from_user_ptr(user_ptr);
@@ -383,6 +383,26 @@ impl Allocator {
                 // header plus membership in this allocator's aligned arena range.
                 if !self.arena.contains_block_start(block_start) {
                     return Err(FreeError::ForeignPointer);
+                }
+                // SAFETY: `block_start` passed header decoding and arena ownership checks, so
+                // the reserved freed marker is readable for duplicate-free detection.
+                if unsafe { small_block_is_marked_freed(block_start) } {
+                    return Err(FreeError::DoubleFree);
+                }
+                if let Some(expected_size) = expected_size {
+                    let recorded = header.requested_size();
+                    if expected_size != recorded {
+                        return Err(FreeError::SizeMismatch {
+                            provided: expected_size,
+                            recorded,
+                        });
+                    }
+                }
+                // SAFETY: the decoded block is still detached from allocator free-list state
+                // at this point, so marking it freed before routing preserves double-free
+                // detection across hot, slab, shared, remote, and central storage.
+                unsafe {
+                    mark_small_block_freed(block_start);
                 }
                 let owner_cache_id = header
                     .small_owner_cache_id()
@@ -413,6 +433,15 @@ impl Allocator {
                 Ok(())
             }
             AllocationKind::Large => {
+                if let Some(expected_size) = expected_size {
+                    let recorded = header.requested_size();
+                    if expected_size != recorded {
+                        return Err(FreeError::SizeMismatch {
+                            provided: expected_size,
+                            recorded,
+                        });
+                    }
+                }
                 self.large.validate_and_release_live_allocation(
                     user_ptr,
                     header.requested_size(),
