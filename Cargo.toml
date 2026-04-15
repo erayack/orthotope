@@ -1,6 +1,6 @@
 [package]
 name = "orthotope"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2024"
 description = "Arena-based memory allocator with per-thread caches and fixed size classes, designed for allocation-heavy workloads like ML inference and tensor pipelines"
 license = "MIT"
