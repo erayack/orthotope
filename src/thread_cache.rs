@@ -560,7 +560,9 @@ impl LocalSlab {
         let addr = block.as_ptr().addr();
         let start = self.start.as_ptr().addr();
 
-        addr >= start && addr < self.end_addr && (addr - start).is_multiple_of(self.block_size)
+        addr >= start
+            && addr < self.end_addr
+            && slab_addr_alignment_matches(addr, start, self.block_size)
     }
 
     /// Pops one block from this slab, preferring reclaimed blocks before untouched
@@ -568,8 +570,10 @@ impl LocalSlab {
     unsafe fn pop_block(&mut self) -> Option<(NonNull<u8>, BlockReuse)> {
         if !self.free.is_empty() {
             // SAFETY: the slab owns this free list exclusively through `&mut self`.
+            // Reclaimed slab entries were previously allocated from this cache, so owner
+            // metadata remains valid and only requested-size refresh is needed.
             return unsafe { self.free.pop_block() }
-                .map(|block| (block, BlockReuse::NeedsHeaderRewrite));
+                .map(|block| (block, BlockReuse::HotReuseRequestedOnly));
         }
 
         if self.next_fresh < self.capacity {
@@ -644,6 +648,16 @@ impl LocalSlab {
         // SAFETY: the temporary list now owns exactly `taken` valid detached blocks.
         unsafe { list.pop_batch(taken) }
     }
+}
+
+#[cfg(debug_assertions)]
+const fn slab_addr_alignment_matches(addr: usize, start: usize, block_size: usize) -> bool {
+    (addr - start).is_multiple_of(block_size)
+}
+
+#[cfg(not(debug_assertions))]
+const fn slab_addr_alignment_matches(_addr: usize, _start: usize, _block_size: usize) -> bool {
+    true
 }
 
 pub(crate) struct ThreadCacheHandle {

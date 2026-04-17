@@ -27,7 +27,7 @@ static SYSTEM_ALLOCATOR: std::alloc::System = std::alloc::System;
 static MIMALLOC_ALLOCATOR: MiMalloc = MiMalloc;
 static JEMALLOC_ALLOCATOR: Jemalloc = Jemalloc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum AllocatorKind {
     Orthotope,
     System,
@@ -182,10 +182,27 @@ impl AllocationApi for OrthotopeBackend {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let workloads = workloads();
+    let workload_filter = std::env::var("ORTHOTOPE_BENCH_WORKLOAD").ok();
+    let allocator_filter = std::env::var("ORTHOTOPE_BENCH_ALLOCATOR").ok();
+
     let mut rows = Vec::new();
 
     for workload in workloads {
+        if workload_filter
+            .as_deref()
+            .is_some_and(|filter| workload.name != filter)
+        {
+            continue;
+        }
+
         for allocator in AllocatorKind::ALL {
+            if allocator_filter
+                .as_deref()
+                .is_some_and(|filter| allocator.name() != filter)
+            {
+                continue;
+            }
+
             let elapsed = measure(workload, allocator)?;
             let per_op = per_operation(elapsed, workload.operations, workload.unit);
             rows.push(ResultRow {
