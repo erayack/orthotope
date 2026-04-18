@@ -14,6 +14,7 @@ pub const HEADER_SIZE: usize = 64;
 
 const HEADER_MAGIC: u32 = 0x4f52_5448;
 const LARGE_CLASS_SENTINEL: u8 = u8::MAX;
+#[cfg(debug_assertions)]
 const SMALL_FREE_MARKER_SEED: usize = usize::MAX ^ (HEADER_MAGIC as usize);
 const HEADER_SCRATCH_RESERVED_SIZE: usize = size_of::<u32>();
 const HEADER_TAIL_PADDING_SIZE: usize = HEADER_SIZE
@@ -527,7 +528,7 @@ pub(crate) unsafe fn small_block_is_marked_freed(block_start: NonNull<u8>) -> bo
 }
 
 #[cfg(not(debug_assertions))]
-pub(crate) const fn small_block_is_marked_freed(_block_start: NonNull<u8>) -> bool {
+pub(crate) const unsafe fn small_block_is_marked_freed(_block_start: NonNull<u8>) -> bool {
     false
 }
 
@@ -542,7 +543,7 @@ pub(crate) unsafe fn mark_small_block_freed(block_start: NonNull<u8>) {
 }
 
 #[cfg(not(debug_assertions))]
-pub(crate) const fn mark_small_block_freed(_block_start: NonNull<u8>) {}
+pub(crate) const unsafe fn mark_small_block_freed(_block_start: NonNull<u8>) {}
 
 #[cfg(debug_assertions)]
 pub(crate) unsafe fn clear_small_block_freed(block_start: NonNull<u8>) {
@@ -555,7 +556,7 @@ pub(crate) unsafe fn clear_small_block_freed(block_start: NonNull<u8>) {
 }
 
 #[cfg(not(debug_assertions))]
-pub(crate) const fn clear_small_block_freed(_block_start: NonNull<u8>) {}
+pub(crate) const unsafe fn clear_small_block_freed(_block_start: NonNull<u8>) {}
 
 #[must_use]
 const fn size_class_to_index(class: SizeClass) -> u8 {
