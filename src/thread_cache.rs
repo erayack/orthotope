@@ -360,12 +360,13 @@ impl LocalClassCache {
         }
 
         // SAFETY: the caller guarantees the shared list only contains valid detached nodes.
-        let block = unsafe { self.shared.pop_block() };
-        if block.is_some() {
+        if let Some(block) = unsafe { self.shared.pop_block() } {
             self.shared_len -= 1;
             self.total_len -= 1;
+            return Some((block, BlockReuse::NeedsHeaderRewrite));
         }
-        block.map(|block| (block, BlockReuse::NeedsHeaderRewrite))
+
+        None
     }
 
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
@@ -568,19 +569,16 @@ impl LocalSlab {
     /// Pops one block from this slab, preferring reclaimed blocks before untouched
     /// fresh capacity so same-thread frees are reused immediately.
     unsafe fn pop_block(&mut self) -> Option<(NonNull<u8>, BlockReuse)> {
-        if !self.free.is_empty() {
-            // SAFETY: the slab owns this free list exclusively through `&mut self`.
-            // Reclaimed slab entries were previously allocated from this cache, so owner
-            // metadata remains valid and only requested-size refresh is needed.
-            return unsafe { self.free.pop_block() }
-                .map(|block| (block, BlockReuse::HotReuseRequestedOnly));
+        // SAFETY: the slab owns this free list exclusively through `&mut self`.
+        // Reclaimed slab entries were previously allocated from this cache, so owner
+        // metadata remains valid and only requested-size refresh is needed.
+        if let Some(block) = unsafe { self.free.pop_block() } {
+            return Some((block, BlockReuse::HotReuseRequestedOnly));
         }
 
         if self.next_fresh < self.capacity {
-            let offset = self
-                .next_fresh
-                .checked_mul(self.block_size)
-                .unwrap_or_else(|| unreachable!("fresh slab offset overflowed"));
+            debug_assert!(self.next_fresh < self.capacity);
+            let offset = self.next_fresh * self.block_size;
             self.next_fresh += 1;
             let block = self.start.as_ptr().wrapping_add(offset);
             // SAFETY: `offset` remains within the slab bounds and `start` is non-null.
@@ -620,14 +618,12 @@ impl LocalSlab {
         let mut taken = 0;
 
         while taken < max {
-            let block = if !self.free.is_empty() {
-                // SAFETY: the slab owns this free list exclusively through `&mut self`.
-                unsafe { self.free.pop_block() }
+            // SAFETY: the slab owns this free list exclusively through `&mut self`.
+            let block = if let Some(block) = unsafe { self.free.pop_block() } {
+                Some(block)
             } else if self.next_fresh < self.capacity {
-                let offset = self
-                    .next_fresh
-                    .checked_mul(self.block_size)
-                    .unwrap_or_else(|| unreachable!("fresh slab batch offset overflowed"));
+                debug_assert!(self.next_fresh < self.capacity);
+                let offset = self.next_fresh * self.block_size;
                 self.next_fresh += 1;
                 let block = self.start.as_ptr().wrapping_add(offset);
                 // SAFETY: the computed block start lies within this slab and is non-null.

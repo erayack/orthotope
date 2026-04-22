@@ -500,16 +500,9 @@ fn initialize_small_span_headers(
     blocks: usize,
     class: SizeClass,
 ) -> Result<(), AllocError> {
+    let mut block_start = span_start;
     for index in 0..blocks {
-        let offset = index
-            .checked_mul(block_size)
-            .ok_or(AllocError::OutOfMemory {
-                requested: block_size,
-                remaining: 0,
-            })?;
-        let block_start = span_start.as_ptr().wrapping_add(offset);
-        // SAFETY: `offset` walks a bounded set of block starts inside one reserved span.
-        let block_start = unsafe { NonNull::new_unchecked(block_start) };
+        // SAFETY: `block_start` walks the contiguous block starts inside one reserved span.
         let _ =
             AllocationHeader::initialize_small_to_block(block_start, class).ok_or_else(|| {
                 AllocError::OutOfMemory {
@@ -517,6 +510,12 @@ fn initialize_small_span_headers(
                     remaining: 0,
                 }
             })?;
+        if index + 1 != blocks {
+            let next = block_start.as_ptr().wrapping_add(block_size);
+            // SAFETY: the reserved span contains exactly `blocks` contiguous block starts at
+            // `block_size` spacing, so each pointer increment remains within that span.
+            block_start = unsafe { NonNull::new_unchecked(next) };
+        }
     }
 
     Ok(())

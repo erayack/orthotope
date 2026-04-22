@@ -231,9 +231,15 @@ impl ClassPool {
             // SAFETY: `list` owns only detached nodes from the incoming batch.
             unsafe { list.pop_block() }
         } {
-            let index = self.find_slab_index(block).unwrap_or_else(|| {
-                panic!(
-                    "returned block {:#x} does not belong to any registered central slab",
+            let slab_index = self.find_slab_index(block);
+            debug_assert!(
+                slab_index.is_some(),
+                "returned block {:#x} must belong to a registered central slab",
+                block.as_ptr().addr()
+            );
+            let index = slab_index.unwrap_or_else(|| {
+                unreachable!(
+                    "returned block {:#x} must belong to a registered central slab",
                     block.as_ptr().addr()
                 )
             });
@@ -489,8 +495,10 @@ impl SlabRecord {
     }
 
     fn start_ptr(&self) -> NonNull<u8> {
-        NonNull::new(self.start as *mut u8)
-            .unwrap_or_else(|| unreachable!("registered slab start must be non-null"))
+        debug_assert_ne!(self.start, 0, "registered slab start must be non-null");
+        // SAFETY: slab registration only accepts `NonNull<u8>` starts, and `start`
+        // is never mutated after construction except by replacing the whole record.
+        unsafe { NonNull::new_unchecked(self.start as *mut u8) }
     }
 
     unsafe fn record_returned_block(&mut self, block: NonNull<u8>) {

@@ -104,6 +104,8 @@ impl FreeList {
             return;
         }
 
+        debug_assert!(head.is_some(), "non-empty batch must have a head");
+        debug_assert!(tail.is_some(), "non-empty batch must have a tail");
         let head = head.unwrap_or_else(|| unreachable!("non-empty batch must have a head"));
         let tail = tail.unwrap_or_else(|| unreachable!("non-empty batch must have a tail"));
 
@@ -130,6 +132,7 @@ impl FreeList {
         }
 
         let take = core::cmp::min(max, self.len);
+        debug_assert!(self.head.is_some(), "non-empty list must have a head");
         let head = self
             .head
             .unwrap_or_else(|| unreachable!("non-empty list must have a head"));
