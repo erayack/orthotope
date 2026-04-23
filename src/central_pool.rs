@@ -310,19 +310,10 @@ impl ClassPool {
         for _ in 0..blocks {
             // SAFETY: `list` was initialized from a detached batch with exactly `blocks`
             // nodes, so each iteration pops one valid block until the batch is exhausted.
-            let block = unsafe { list.pop_block().unwrap_unchecked() };
-            let slab_id = self.find_slab_id(block);
-            debug_assert!(
-                slab_id.is_some(),
-                "returned block {:#x} must belong to a registered central slab",
-                block.as_ptr().addr()
-            );
-            let slab_id = slab_id.unwrap_or_else(|| {
-                unreachable!(
-                    "returned block {:#x} must belong to a registered central slab",
-                    block.as_ptr().addr()
-                )
-            });
+            let block = unsafe { list.pop_block_unchecked() };
+            // SAFETY: `return_batch` accepts only detached blocks from slabs already
+            // registered for this class, so lookup cannot fail for valid input.
+            let slab_id = unsafe { self.find_slab_id_unchecked(block) };
             self.recent_slab = Some(slab_id);
             self.slabs[slab_id].last_touched_epoch = epoch;
             let previous_state = self.slabs[slab_id].state;
@@ -379,28 +370,29 @@ impl ClassPool {
         }
     }
 
-    fn find_slab_id(&mut self, block: NonNull<u8>) -> Option<SlabId> {
+    unsafe fn find_slab_id_unchecked(&mut self, block: NonNull<u8>) -> SlabId {
         if let Some(slab_id) = self
             .recent_slab
             .filter(|&slab_id| self.slabs[slab_id].contains(block))
         {
-            return Some(slab_id);
+            return slab_id;
         }
 
         let addr = block.as_ptr().addr();
         let index = self
             .slabs_by_start
             .partition_point(|&slab_id| self.slabs[slab_id].start <= addr);
-        if index == 0 {
-            return None;
-        }
+        debug_assert!(
+            index != 0,
+            "returned block {addr:#x} must belong to a registered central slab"
+        );
         let slab_id = self.slabs_by_start[index - 1];
-        if self.slabs[slab_id].contains(block) {
-            self.recent_slab = Some(slab_id);
-            Some(slab_id)
-        } else {
-            None
-        }
+        debug_assert!(
+            self.slabs[slab_id].contains(block),
+            "returned block {addr:#x} must belong to a registered central slab"
+        );
+        self.recent_slab = Some(slab_id);
+        slab_id
     }
 
     fn maybe_sweep(&mut self) {

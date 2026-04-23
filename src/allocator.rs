@@ -297,7 +297,7 @@ impl Allocator {
         };
 
         let carved = span.size() / block_size;
-        initialize_small_span_headers(span.start(), block_size, carved, class)?;
+        initialize_small_span_headers(span.start(), block_size, carved, class);
         self.central
             .register_slab(class, span.start(), block_size, carved);
 
@@ -501,17 +501,15 @@ fn initialize_small_span_headers(
     block_size: usize,
     blocks: usize,
     class: SizeClass,
-) -> Result<(), AllocError> {
+) {
     let mut block_start = span_start;
     for index in 0..blocks {
-        // SAFETY: `block_start` walks the contiguous block starts inside one reserved span.
-        let _ =
-            AllocationHeader::initialize_small_to_block(block_start, class).ok_or_else(|| {
-                AllocError::OutOfMemory {
-                    requested: class.payload_size(),
-                    remaining: 0,
-                }
-            })?;
+        // SAFETY: `block_start` walks the contiguous block starts inside one reserved
+        // span, and Orthotope's built-in small size classes always fit the header's
+        // fixed-width encoding.
+        unsafe {
+            AllocationHeader::initialize_small_to_block_unchecked(block_start, class);
+        }
         if index + 1 != blocks {
             let next = block_start.as_ptr().wrapping_add(block_size);
             // SAFETY: the reserved span contains exactly `blocks` contiguous block starts at
@@ -519,8 +517,6 @@ fn initialize_small_span_headers(
             block_start = unsafe { NonNull::new_unchecked(next) };
         }
     }
-
-    Ok(())
 }
 
 const fn align_up_checked(value: usize, alignment: usize) -> Option<usize> {

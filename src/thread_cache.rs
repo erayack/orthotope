@@ -334,7 +334,7 @@ impl LocalClassCache {
 
         if self.shared_len != 0 {
             // SAFETY: `shared_len != 0` guarantees that the intrusive shared list is non-empty.
-            let block = unsafe { self.shared.pop_block().unwrap_unchecked() };
+            let block = unsafe { self.shared.pop_block_unchecked() };
             self.shared_len -= 1;
             self.total_len -= 1;
             return Some((block, BlockReuse::NeedsOwnerAndRequestedSizeRefresh));
@@ -540,12 +540,15 @@ impl LocalSlab {
         // SAFETY: the slab owns this free list exclusively through `&mut self`.
         // Reclaimed slab entries were previously allocated from this cache, so owner
         // metadata remains valid and only requested-size refresh is needed.
-        if let Some(block) = unsafe { self.free.pop_block() } {
-            return Some((block, BlockReuse::HotReuseRequestedOnly));
+        if !self.free.is_empty() {
+            return Some((
+                // SAFETY: `!self.free.is_empty()` proves the slab-local free list is non-empty.
+                unsafe { self.free.pop_block_unchecked() },
+                BlockReuse::HotReuseRequestedOnly,
+            ));
         }
 
         if self.next_fresh < self.capacity {
-            debug_assert!(self.next_fresh < self.capacity);
             let offset = self.next_fresh * self.block_size;
             self.next_fresh += 1;
             let block = self.start.as_ptr().wrapping_add(offset);
@@ -583,33 +586,29 @@ impl LocalSlab {
         );
 
         let mut list = FreeList::new();
-        let mut taken = 0;
-
-        while taken < max {
-            // SAFETY: the slab owns this free list exclusively through `&mut self`.
-            let block = if let Some(block) = unsafe { self.free.pop_block() } {
-                Some(block)
-            } else if self.next_fresh < self.capacity {
-                debug_assert!(self.next_fresh < self.capacity);
-                let offset = self.next_fresh * self.block_size;
-                self.next_fresh += 1;
-                let block = self.start.as_ptr().wrapping_add(offset);
-                // SAFETY: the computed block start lies within this slab and is non-null.
-                Some(unsafe { NonNull::new_unchecked(block) })
-            } else {
-                None
-            };
-
-            let Some(block) = block else {
-                break;
-            };
-
-            // SAFETY: each detached block is valid for this slab's class and owned by `list`.
+        let reclaimed = core::cmp::min(self.free.len(), max);
+        for _ in 0..reclaimed {
+            // SAFETY: `reclaimed` is bounded by the free-list length captured above.
+            let block = unsafe { self.free.pop_block_unchecked() };
+            // SAFETY: each reclaimed block is detached from `self.free` and valid for this slab.
             unsafe { list.push_block(block) };
-            taken += 1;
         }
 
-        // SAFETY: the temporary list now owns exactly `taken` valid detached blocks.
+        let fresh = core::cmp::min(max - reclaimed, self.capacity - self.next_fresh);
+        let fresh_start = self.next_fresh;
+        self.next_fresh += fresh;
+        for index in fresh_start..fresh_start + fresh {
+            let offset = index * self.block_size;
+            let block = self.start.as_ptr().wrapping_add(offset);
+            // SAFETY: `index` stays within remaining slab capacity, so each computed
+            // block start lies within the slab and is non-null.
+            unsafe { list.push_block(NonNull::new_unchecked(block)) };
+        }
+
+        let taken = reclaimed + fresh;
+        debug_assert!(taken != 0, "available slab must yield a non-empty batch");
+        // SAFETY: the temporary list owns exactly `taken` detached blocks, preserving the
+        // previous LIFO batch order while avoiding per-iteration availability checks.
         unsafe { list.pop_batch(taken) }
     }
 }

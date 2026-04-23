@@ -198,26 +198,36 @@ impl AllocationHeader {
         Some(header_ptr)
     }
 
-    pub(crate) fn initialize_small_to_block(
+    /// Initializes a fresh small-block header without re-validating the size-class encoding.
+    ///
+    /// # Safety
+    ///
+    /// `class` must be one of Orthotope's built-in size classes, which guarantees its
+    /// payload size fits in `u32`. `block_start` must name writable header storage for a
+    /// valid allocator block start.
+    pub(crate) unsafe fn initialize_small_to_block_unchecked(
         block_start: NonNull<u8>,
         class: SizeClass,
-    ) -> Option<NonNull<Self>> {
+    ) -> NonNull<Self> {
+        debug_assert!(
+            u32::try_from(class.payload_size()).is_ok(),
+            "small size class payload must fit in header encoding"
+        );
         let class_index = size_class_to_index(class);
-        let usable_size = u32::try_from(class.payload_size()).ok()?;
+        // SAFETY: `class` is one of Orthotope's built-in small classes. The largest
+        // payload is 16 MiB, so this conversion is infallible by construction.
+        let usable_size = unsafe { u32::try_from(class.payload_size()).unwrap_unchecked() };
         let header_ptr = header_from_block_start(block_start);
 
         debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
 
-        // SAFETY: `header_ptr` names the 64-byte header region at the start of a valid
-        // allocator block. Fresh slab entries keep a non-live requested-size marker so
-        // untouched blocks are not accepted by deallocation before first allocation.
-        // `write_small_prefix` routes through `write_encoded_fields`, which also clears
-        // the reserved free-list metadata words and tail padding for the fresh block.
+        // SAFETY: the caller provides a valid block start for this size class, and all
+        // built-in small classes encode losslessly in the header fields.
         unsafe {
             Self::write_small_prefix(header_ptr, class_index, 0, usable_size);
         }
 
-        Some(header_ptr)
+        header_ptr
     }
 
     pub(crate) fn refresh_small_requested_size(

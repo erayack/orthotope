@@ -76,7 +76,28 @@ impl FreeList {
     /// this list.
     #[must_use]
     pub(crate) unsafe fn pop_block(&mut self) -> Option<NonNull<u8>> {
-        let head = self.head?;
+        if self.len == 0 {
+            return None;
+        }
+
+        // SAFETY: `self.len != 0` proves the list is non-empty and the intrusive list
+        // invariant guarantees `self.head.is_some()` in that state.
+        Some(unsafe { self.pop_block_unchecked() })
+    }
+
+    /// Pops one free block from the list without re-checking emptiness.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `self.len != 0`. As with [`Self::pop_block`], every
+    /// linked node must point to writable storage large enough for the reserved
+    /// small-block link word and must belong exclusively to this list.
+    #[must_use]
+    pub(crate) unsafe fn pop_block_unchecked(&mut self) -> NonNull<u8> {
+        debug_assert!(self.len != 0, "unchecked pop requires a non-empty list");
+        // SAFETY: the caller guarantees the list is non-empty, so the list invariant
+        // guarantees `self.head.is_some()`.
+        let head = unsafe { self.head.unwrap_unchecked() };
         // SAFETY: `head` is a node already linked in this list, so reading its next
         // pointer is valid under the list invariants.
         let next = unsafe { read_small_free_list_next(head) };
@@ -87,7 +108,7 @@ impl FreeList {
         unsafe {
             write_small_free_list_next(head, None);
         }
-        Some(head)
+        head
     }
 
     /// Prepends a detached batch to this list while preserving batch order.
