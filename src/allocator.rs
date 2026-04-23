@@ -234,10 +234,10 @@ impl Allocator {
             }
         }
 
-        let (block_start, reuse) = cache.pop(class).ok_or_else(|| AllocError::OutOfMemory {
-            requested: requested_size,
-            remaining: self.arena.remaining(),
-        })?;
+        // SAFETY: this point is reached only when the class cache was already non-empty,
+        // a central refill moved at least one block, or an arena refill carved at least
+        // one block. Therefore the selected class has a block available.
+        let (block_start, reuse) = unsafe { cache.pop_available_unchecked(class) };
 
         // SAFETY: `block_start` has been detached from every free-list structure before
         // reaching this allocation path, so its reserved free-list metadata can be reset.
@@ -247,34 +247,38 @@ impl Allocator {
 
         match reuse {
             BlockReuse::HotReuseRequestedOnly => {
-                let _ = AllocationHeader::refresh_small_requested_size(block_start, requested_size)
-                    .ok_or_else(|| AllocError::OutOfMemory {
-                        requested: requested_size,
-                        remaining: self.arena.remaining(),
-                    })?;
+                // SAFETY: `class` was produced by `SizeClass::from_request(requested_size)`,
+                // so the non-zero request fits the class payload and the header's `u32`
+                // encoding for all built-in small classes.
+                unsafe {
+                    AllocationHeader::refresh_small_requested_size_unchecked(
+                        block_start,
+                        requested_size,
+                    );
+                }
             }
             BlockReuse::NeedsOwnerAndRequestedSizeRefresh => {
-                let _ = AllocationHeader::refresh_small_requested_size_and_owner(
-                    block_start,
-                    requested_size,
-                    cache.cache_id(),
-                )
-                .ok_or_else(|| AllocError::OutOfMemory {
-                    requested: requested_size,
-                    remaining: self.arena.remaining(),
-                })?;
+                // SAFETY: same request-size invariant as above; this block already has
+                // initialized small metadata and only the hot fields need refreshing.
+                unsafe {
+                    AllocationHeader::refresh_small_requested_size_and_owner_unchecked(
+                        block_start,
+                        requested_size,
+                        cache.cache_id(),
+                    );
+                }
             }
             BlockReuse::NeedsHeaderRewrite => {
-                let _ = AllocationHeader::write_small_to_block(
-                    block_start,
-                    class,
-                    requested_size,
-                    cache.cache_id(),
-                )
-                .ok_or_else(|| AllocError::OutOfMemory {
-                    requested: requested_size,
-                    remaining: self.arena.remaining(),
-                })?;
+                // SAFETY: `class` and `requested_size` came from the public allocation
+                // boundary classification, so the small header fields encode losslessly.
+                unsafe {
+                    AllocationHeader::write_small_to_block_unchecked(
+                        block_start,
+                        class,
+                        requested_size,
+                        cache.cache_id(),
+                    );
+                }
             }
         }
 
@@ -502,20 +506,18 @@ fn initialize_small_span_headers(
     blocks: usize,
     class: SizeClass,
 ) {
-    let mut block_start = span_start;
-    for index in 0..blocks {
+    let mut block_start = span_start.as_ptr();
+    for _ in 0..blocks {
         // SAFETY: `block_start` walks the contiguous block starts inside one reserved
         // span, and Orthotope's built-in small size classes always fit the header's
         // fixed-width encoding.
         unsafe {
-            AllocationHeader::initialize_small_to_block_unchecked(block_start, class);
+            AllocationHeader::initialize_small_to_block_unchecked(
+                NonNull::new_unchecked(block_start),
+                class,
+            );
         }
-        if index + 1 != blocks {
-            let next = block_start.as_ptr().wrapping_add(block_size);
-            // SAFETY: the reserved span contains exactly `blocks` contiguous block starts at
-            // `block_size` spacing, so each pointer increment remains within that span.
-            block_start = unsafe { NonNull::new_unchecked(next) };
-        }
+        block_start = block_start.wrapping_add(block_size);
     }
 }
 

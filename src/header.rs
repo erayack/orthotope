@@ -198,6 +198,49 @@ impl AllocationHeader {
         Some(header_ptr)
     }
 
+    /// Writes a small-block header without re-validating size-class/request encoding.
+    ///
+    /// # Safety
+    ///
+    /// `requested_size` must be in `1..=class.payload_size()`, `class.payload_size()`
+    /// and `requested_size` must fit in `u32`, and `block_start` must name writable
+    /// header storage for a valid allocator block start.
+    pub(crate) unsafe fn write_small_to_block_unchecked(
+        block_start: NonNull<u8>,
+        class: SizeClass,
+        requested_size: usize,
+        owner_cache_id: u32,
+    ) -> NonNull<Self> {
+        debug_assert!(requested_size > 0);
+        debug_assert!(requested_size <= class.payload_size());
+        debug_assert!(u32::try_from(requested_size).is_ok());
+        debug_assert!(u32::try_from(class.payload_size()).is_ok());
+
+        let class_index = size_class_to_index(class);
+        // SAFETY: the caller guarantees the request and class payload encode losslessly.
+        let requested_size = unsafe { u32::try_from(requested_size).unwrap_unchecked() };
+        // SAFETY: same invariant as above for built-in small-class payload size.
+        let usable_size = unsafe { u32::try_from(class.payload_size()).unwrap_unchecked() };
+        let header_ptr = header_from_block_start(block_start);
+
+        debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+
+        // SAFETY: the caller provides valid writable header storage, and the encoded
+        // fields have been proven valid by the function preconditions.
+        unsafe {
+            Self::write_encoded_fields(
+                header_ptr,
+                AllocationKindTag::Small,
+                class_index,
+                requested_size,
+                usable_size,
+                owner_cache_id,
+            );
+        }
+
+        header_ptr
+    }
+
     /// Initializes a fresh small-block header without re-validating the size-class encoding.
     ///
     /// # Safety
@@ -230,14 +273,27 @@ impl AllocationHeader {
         header_ptr
     }
 
-    pub(crate) fn refresh_small_requested_size(
+    /// Refreshes the requested-size field without re-validating header encoding.
+    ///
+    /// # Safety
+    ///
+    /// `requested_size` must be in `1..=current small header usable_size`, must fit in
+    /// `u32`, and `block_start` must name an initialized writable small-allocation header.
+    pub(crate) unsafe fn refresh_small_requested_size_unchecked(
         block_start: NonNull<u8>,
         requested_size: usize,
-    ) -> Option<NonNull<Self>> {
-        let requested_size = u32::try_from(requested_size).ok()?;
+    ) -> NonNull<Self> {
+        debug_assert!(requested_size > 0);
+        debug_assert!(u32::try_from(requested_size).is_ok());
+        // SAFETY: the caller guarantees the request size encodes losslessly.
+        let requested_size = unsafe { u32::try_from(requested_size).unwrap_unchecked() };
         let header_ptr = header_from_block_start(block_start);
 
         debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+        // SAFETY: the caller guarantees `block_start` names an initialized small header;
+        // reading `usable_size` only checks that the requested-size refresh preserves
+        // the live-header invariant in debug builds.
+        debug_assert!(unsafe { (*header_ptr.as_ptr()).usable_size >= requested_size });
 
         // SAFETY: `header_ptr` points to an initialized small-allocation header, so
         // updating only the requested-size field preserves the routing metadata.
@@ -245,27 +301,40 @@ impl AllocationHeader {
             ptr::addr_of_mut!((*header_ptr.as_ptr()).requested_size).write(requested_size);
         }
 
-        Some(header_ptr)
+        header_ptr
     }
 
-    pub(crate) fn refresh_small_requested_size_and_owner(
+    /// Refreshes requested size and owner without re-validating header encoding.
+    ///
+    /// # Safety
+    ///
+    /// `requested_size` must be in `1..=current small header usable_size`, must fit in
+    /// `u32`, and `block_start` must name an initialized writable small-allocation header.
+    pub(crate) unsafe fn refresh_small_requested_size_and_owner_unchecked(
         block_start: NonNull<u8>,
         requested_size: usize,
         owner_cache_id: u32,
-    ) -> Option<NonNull<Self>> {
-        let requested_size = u32::try_from(requested_size).ok()?;
+    ) -> NonNull<Self> {
+        debug_assert!(requested_size > 0);
+        debug_assert!(u32::try_from(requested_size).is_ok());
+        // SAFETY: the caller guarantees the request size encodes losslessly.
+        let requested_size = unsafe { u32::try_from(requested_size).unwrap_unchecked() };
         let header_ptr = header_from_block_start(block_start);
 
         debug_assert_eq!(block_start.as_ptr().addr() % HEADER_ALIGNMENT, 0);
+        // SAFETY: the caller guarantees `block_start` names an initialized small header;
+        // reading `usable_size` only checks that the hot-field refresh preserves the
+        // live-header invariant in debug builds.
+        debug_assert!(unsafe { (*header_ptr.as_ptr()).usable_size >= requested_size });
 
         // SAFETY: `header_ptr` points to an initialized small-allocation header, so
-        // updating only the requested-size field preserves the routing metadata.
+        // updating these hot-path fields preserves the routing metadata.
         unsafe {
             ptr::addr_of_mut!((*header_ptr.as_ptr()).requested_size).write(requested_size);
             ptr::addr_of_mut!((*header_ptr.as_ptr()).owner_cache_id).write(owner_cache_id);
         }
 
-        Some(header_ptr)
+        header_ptr
     }
 
     #[allow(dead_code)]

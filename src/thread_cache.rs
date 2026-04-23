@@ -95,9 +95,25 @@ impl ThreadCache {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn pop(&mut self, class: SizeClass) -> Option<(NonNull<u8>, BlockReuse)> {
         // SAFETY: `ThreadCache` has exclusive mutable access to the class cache.
         unsafe { self.classes[class.index()].pop_block() }
+    }
+
+    /// Pops one block from a class known to be non-empty.
+    ///
+    /// # Safety
+    ///
+    /// The local cache for `class` must contain at least one available block.
+    #[must_use]
+    pub(crate) unsafe fn pop_available_unchecked(
+        &mut self,
+        class: SizeClass,
+    ) -> (NonNull<u8>, BlockReuse) {
+        // SAFETY: the caller guarantees the selected class cache is non-empty, and
+        // `ThreadCache` has exclusive mutable access to it.
+        unsafe { self.classes[class.index()].pop_block_unchecked() }
     }
 
     /// Pushes one block into the local free list for `class`.
@@ -307,40 +323,56 @@ impl LocalClassCache {
             .unwrap_or_else(|| unreachable!("local class cache size overflowed"));
     }
 
+    #[cfg(test)]
     unsafe fn pop_block(&mut self) -> Option<(NonNull<u8>, BlockReuse)> {
+        if self.total_len == 0 {
+            None
+        } else {
+            // SAFETY: `self.total_len != 0` proves the cache has one backing source.
+            Some(unsafe { self.pop_block_unchecked() })
+        }
+    }
+
+    unsafe fn pop_block_unchecked(&mut self) -> (NonNull<u8>, BlockReuse) {
+        debug_assert!(
+            self.total_len != 0,
+            "unchecked pop requires a non-empty cache"
+        );
+
         if let Some(block) = self.hot_block.take() {
             self.total_len -= 1;
-            return Some((block, BlockReuse::HotReuseRequestedOnly));
+            return (block, BlockReuse::HotReuseRequestedOnly);
         }
 
         if !self.available_slabs.is_empty() {
-            // SAFETY: the loop guard guarantees the vector is non-empty.
+            // SAFETY: the guard guarantees the vector is non-empty.
             let slab_id = unsafe { *self.available_slabs.last().unwrap_unchecked() };
             let slab = &mut self.slabs[slab_id];
             debug_assert!(
                 slab.has_available_blocks(),
                 "available slab list must contain only non-empty slabs"
             );
-            // SAFETY: membership in `available_slabs` guarantees that `slab.pop_block()`
-            // returns a block while this cache holds exclusive mutable access.
-            let (block, reuse) = unsafe { slab.pop_block().unwrap_unchecked() };
+            // SAFETY: membership in `available_slabs` guarantees this slab can return
+            // a block while this cache holds exclusive mutable access.
+            let (block, reuse) = unsafe { slab.pop_block_unchecked() };
             self.recent_slab = Some(slab_id);
             self.total_len -= 1;
             if !slab.has_available_blocks() {
                 self.mark_slab_unavailable(slab_id);
             }
-            return Some((block, reuse));
+            return (block, reuse);
         }
 
-        if self.shared_len != 0 {
-            // SAFETY: `shared_len != 0` guarantees that the intrusive shared list is non-empty.
-            let block = unsafe { self.shared.pop_block_unchecked() };
-            self.shared_len -= 1;
-            self.total_len -= 1;
-            return Some((block, BlockReuse::NeedsOwnerAndRequestedSizeRefresh));
-        }
-
-        None
+        debug_assert!(
+            self.shared_len != 0,
+            "non-empty cache must have a backing source"
+        );
+        // SAFETY: `self.total_len != 0` and no hot/slab block imply the shared list is
+        // non-empty by the local class-cache accounting invariant.
+        let block = unsafe { self.shared.pop_block_unchecked() };
+        self.shared_len -= 1;
+        self.total_len -= 1;
+        (block, BlockReuse::NeedsOwnerAndRequestedSizeRefresh)
     }
 
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
@@ -402,7 +434,7 @@ impl LocalClassCache {
 
         if self.shared_len != 0 {
             // SAFETY: the shared list contains only valid detached nodes for this class.
-            let batch = unsafe { self.shared.pop_batch(max) };
+            let batch = unsafe { self.shared.pop_batch_unchecked(max) };
             let len = batch.len();
             self.shared_len -= len;
             self.total_len -= len;
@@ -534,35 +566,37 @@ impl LocalSlab {
             && slab_addr_alignment_matches(addr, start, self.block_size)
     }
 
-    /// Pops one block from this slab, preferring reclaimed blocks before untouched
-    /// fresh capacity so same-thread frees are reused immediately.
-    unsafe fn pop_block(&mut self) -> Option<(NonNull<u8>, BlockReuse)> {
+    /// Pops one block from a slab known to have reclaimed or fresh capacity.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure [`Self::has_available_blocks`] is true.
+    unsafe fn pop_block_unchecked(&mut self) -> (NonNull<u8>, BlockReuse) {
+        debug_assert!(
+            self.has_available_blocks(),
+            "unchecked slab pop requires an available block"
+        );
+
         // SAFETY: the slab owns this free list exclusively through `&mut self`.
-        // Reclaimed slab entries were previously allocated from this cache, so owner
-        // metadata remains valid and only requested-size refresh is needed.
         if !self.free.is_empty() {
-            return Some((
+            return (
                 // SAFETY: `!self.free.is_empty()` proves the slab-local free list is non-empty.
                 unsafe { self.free.pop_block_unchecked() },
                 BlockReuse::HotReuseRequestedOnly,
-            ));
+            );
         }
 
-        if self.next_fresh < self.capacity {
-            let offset = self.next_fresh * self.block_size;
-            self.next_fresh += 1;
-            let block = self.start.as_ptr().wrapping_add(offset);
-            // SAFETY: `offset` remains within the slab bounds and `start` is non-null.
-            let reuse = match self.fresh_mode {
-                SlabFreshMode::Preinitialized => BlockReuse::NeedsOwnerAndRequestedSizeRefresh,
-                SlabFreshMode::MustRewrite => BlockReuse::NeedsHeaderRewrite,
-            };
-            // SAFETY: `offset` was derived from bounded slab capacity, so `block`
-            // stays within the slab and cannot be null.
-            return Some((unsafe { NonNull::new_unchecked(block) }, reuse));
-        }
-
-        None
+        debug_assert!(self.next_fresh < self.capacity);
+        let offset = self.next_fresh * self.block_size;
+        self.next_fresh += 1;
+        let block = self.start.as_ptr().wrapping_add(offset);
+        let reuse = match self.fresh_mode {
+            SlabFreshMode::Preinitialized => BlockReuse::NeedsOwnerAndRequestedSizeRefresh,
+            SlabFreshMode::MustRewrite => BlockReuse::NeedsHeaderRewrite,
+        };
+        // SAFETY: the caller guarantees available capacity, so the computed block start
+        // stays within this non-null slab.
+        (unsafe { NonNull::new_unchecked(block) }, reuse)
     }
 
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
@@ -577,9 +611,7 @@ impl LocalSlab {
     /// with untouched fresh capacity so over-limit drains can still return the full
     /// configured count.
     unsafe fn pop_batch(&mut self, max: usize) -> Batch {
-        if max == 0 {
-            return Batch::empty();
-        }
+        debug_assert!(max != 0, "slab batch pop requires a non-zero max");
         debug_assert!(
             self.has_available_blocks(),
             "slab batch pops only occur for slabs tracked as available"

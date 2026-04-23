@@ -209,7 +209,7 @@ impl RemoteReturnInbox {
         }
 
         // SAFETY: `pending` exclusively owns exactly `pending_len` detached valid nodes.
-        let batch = unsafe { self.pending.pop_batch(self.pending_len) };
+        let batch = unsafe { self.pending.pop_batch_unchecked(self.pending_len) };
         self.pending_len = 0;
         batch
     }
@@ -601,7 +601,7 @@ impl SlabRecord {
         debug_assert_eq!(self.state, SlabState::Partial);
         debug_assert!(self.central_free_len > 0);
         // SAFETY: `partial_free` is owned exclusively while the class mutex is held.
-        let batch = unsafe { self.partial_free.pop_batch(max) };
+        let batch = unsafe { self.partial_free.pop_batch_unchecked(max) };
         let moved = batch.len();
         self.central_free_len -= moved;
 

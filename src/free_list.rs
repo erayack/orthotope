@@ -154,6 +154,26 @@ impl FreeList {
             return Batch::empty();
         }
 
+        // SAFETY: the guard above proves `max > 0` and the list is non-empty.
+        unsafe { self.pop_batch_unchecked(max) }
+    }
+
+    /// Detaches up to `max` blocks from the front of a known non-empty list.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `max > 0` and `self.len != 0`. As with
+    /// [`Self::pop_batch`], every linked node must point to writable storage large
+    /// enough for the reserved small-block link word and must belong exclusively to
+    /// this list.
+    #[must_use]
+    pub(crate) unsafe fn pop_batch_unchecked(&mut self, max: usize) -> Batch {
+        debug_assert!(max != 0, "unchecked batch pop requires a non-zero max");
+        debug_assert!(
+            self.len != 0,
+            "unchecked batch pop requires a non-empty list"
+        );
+
         let take = core::cmp::min(max, self.len);
         debug_assert!(self.head.is_some(), "non-empty list must have a head");
         // SAFETY: `self.len != 0` implies `self.head.is_some()` by the list invariant.
