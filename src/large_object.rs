@@ -46,6 +46,7 @@ impl FreeLargeBlock {
 #[derive(Default)]
 struct LargeObjectState {
     live: HashMap<usize, LargeAllocationRecord>,
+    live_bytes: usize,
     free: BTreeMap<usize, Vec<FreeLargeBlock>>,
     free_blocks: usize,
     free_bytes: usize,
@@ -107,7 +108,7 @@ impl LargeObjectAllocator {
         let state = self.state.lock();
         LargeObjectStats {
             live_allocations: state.live.len(),
-            live_bytes: state.live.values().map(|record| record.block_size).sum(),
+            live_bytes: state.live_bytes,
             free_blocks: state.free_blocks,
             free_bytes: state.free_bytes,
         }
@@ -132,13 +133,13 @@ impl LargeObjectAllocator {
             usable_size,
         };
 
-        match self.state.lock().live.entry(user_ptr.as_ptr().addr()) {
-            Entry::Vacant(entry) => {
-                entry.insert(record);
-            }
-            Entry::Occupied(_) => {
-                panic!("large allocation registered twice for the same user pointer");
-            }
+        let mut state = self.state.lock();
+        if let Entry::Vacant(entry) = state.live.entry(user_ptr.as_ptr().addr()) {
+            entry.insert(record);
+            state.live_bytes += block_size;
+            drop(state);
+        } else {
+            panic!("large allocation registered twice for the same user pointer");
         }
     }
 
@@ -165,6 +166,7 @@ impl LargeObjectAllocator {
         }
 
         let removed = state.live.remove(&user_ptr.as_ptr().addr());
+        state.live_bytes -= record.block_size;
         state.insert_free_block(FreeLargeBlock {
             block_addr: record.block_addr,
             block_size: record.block_size,

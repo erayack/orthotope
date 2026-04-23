@@ -17,6 +17,8 @@ pub(crate) enum SlabFreshMode {
     MustRewrite,
 }
 
+type SlabId = usize;
+
 pub(crate) enum CentralRefill {
     Empty,
     Batch(Batch),
@@ -69,19 +71,26 @@ struct SlabRecord {
     bucket_slot: Option<usize>,
 }
 
+struct RemoteReturnInbox {
+    pending: FreeList,
+    pending_len: usize,
+}
+
 struct ClassPool {
     slabs: Vec<SlabRecord>,
-    partial_slabs: Vec<usize>,
-    full_hot_slabs: Vec<usize>,
-    full_cold_slabs: Vec<usize>,
+    slabs_by_start: Vec<SlabId>,
+    partial_slabs: Vec<SlabId>,
+    full_hot_slabs: Vec<SlabId>,
+    full_cold_slabs: Vec<SlabId>,
     epoch: u64,
     sweep_cursor: usize,
-    recent_slab: Option<usize>,
+    recent_slab: Option<SlabId>,
 }
 
 /// Shared per-class slab registry and batch exchange between thread-local caches.
 pub(crate) struct CentralPool {
     lists: [Mutex<ClassPool>; NUM_CLASSES],
+    remote_inboxes: [Mutex<RemoteReturnInbox>; NUM_CLASSES],
 }
 
 impl CentralPool {
@@ -90,6 +99,7 @@ impl CentralPool {
     pub(crate) fn new() -> Self {
         Self {
             lists: core::array::from_fn(|_| Mutex::new(ClassPool::new())),
+            remote_inboxes: core::array::from_fn(|_| Mutex::new(RemoteReturnInbox::new())),
         }
     }
 
@@ -107,7 +117,10 @@ impl CentralPool {
 
     #[must_use]
     pub(crate) fn take_refill(&self, class: SizeClass, max: usize) -> CentralRefill {
-        self.lists[class.index()].lock().take_refill(max)
+        let class_index = class.index();
+        let mut pool = self.lists[class_index].lock();
+        self.drain_remote_inbox(class_index, &mut pool);
+        pool.take_refill(max)
     }
 
     /// Returns a detached batch to the shared pool for `class`.
@@ -118,23 +131,91 @@ impl CentralPool {
     /// previously registered slabs for `class`, and none of its nodes may be linked in
     /// any other free list.
     pub(crate) unsafe fn return_batch(&self, class: SizeClass, batch: Batch) {
+        let class_index = class.index();
+        let mut pool = self.lists[class_index].lock();
+        self.drain_remote_inbox(class_index, &mut pool);
         // SAFETY: the caller guarantees `batch` contains detached valid blocks from
         // registered slabs for this class, and the class mutex serializes mutation.
-        unsafe {
-            self.lists[class.index()].lock().return_batch(batch);
-        }
+        unsafe { pool.return_batch(batch) };
+    }
+
+    /// Publishes a detached remote-free batch for later class-pool resolution.
+    ///
+    /// # Safety
+    ///
+    /// `batch` must describe valid detached blocks belonging to registered slabs for
+    /// `class`, and none of its nodes may be linked in any other free list.
+    pub(crate) unsafe fn publish_remote_batch(&self, class: SizeClass, batch: Batch) {
+        let mut inbox = self.remote_inboxes[class.index()].lock();
+        // SAFETY: the caller guarantees `batch` is a valid detached chain for this class.
+        unsafe { inbox.push_batch(batch) };
     }
 
     #[must_use]
     pub(crate) fn block_counts(&self) -> [usize; NUM_CLASSES] {
-        core::array::from_fn(|index| self.lists[index].lock().central_block_count())
+        core::array::from_fn(|index| {
+            self.lists[index].lock().central_block_count()
+                + self.remote_inboxes[index].lock().pending_len()
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn force_first_full_hot_to_cold_for_test(&self, class: SizeClass) -> bool {
-        self.lists[class.index()]
-            .lock()
-            .force_first_full_hot_to_cold_for_test()
+        let class_index = class.index();
+        let mut pool = self.lists[class_index].lock();
+        self.drain_remote_inbox(class_index, &mut pool);
+        pool.force_first_full_hot_to_cold_for_test()
+    }
+
+    fn drain_remote_inbox(&self, class_index: usize, pool: &mut ClassPool) {
+        let pending = {
+            let mut inbox = self.remote_inboxes[class_index].lock();
+            inbox.take_pending()
+        };
+
+        if pending.is_empty() {
+            return;
+        }
+
+        // SAFETY: the per-class inbox stores only detached valid blocks for this class.
+        unsafe {
+            pool.return_batch(pending);
+        }
+    }
+}
+
+impl RemoteReturnInbox {
+    const fn new() -> Self {
+        Self {
+            pending: FreeList::new(),
+            pending_len: 0,
+        }
+    }
+
+    unsafe fn push_batch(&mut self, batch: Batch) {
+        let len = batch.len();
+        if len == 0 {
+            return;
+        }
+
+        // SAFETY: the caller guarantees `batch` is detached and valid for this class.
+        unsafe { self.pending.push_batch(batch) };
+        self.pending_len += len;
+    }
+
+    fn take_pending(&mut self) -> Batch {
+        if self.pending_len == 0 {
+            return Batch::empty();
+        }
+
+        // SAFETY: `pending` exclusively owns exactly `pending_len` detached valid nodes.
+        let batch = unsafe { self.pending.pop_batch(self.pending_len) };
+        self.pending_len = 0;
+        batch
+    }
+
+    const fn pending_len(&self) -> usize {
+        self.pending_len
     }
 }
 
@@ -142,6 +223,7 @@ impl ClassPool {
     const fn new() -> Self {
         Self {
             slabs: Vec::new(),
+            slabs_by_start: Vec::new(),
             partial_slabs: Vec::new(),
             full_hot_slabs: Vec::new(),
             full_cold_slabs: Vec::new(),
@@ -156,24 +238,20 @@ impl ClassPool {
         let start_addr = start.as_ptr().addr();
 
         match self
-            .slabs
-            .binary_search_by_key(&start_addr, |slab| slab.start)
+            .slabs_by_start
+            .binary_search_by_key(&start_addr, |&slab_id| self.slabs[slab_id].start)
         {
-            Ok(index) => {
-                let slab = &mut self.slabs[index];
-                debug_assert_eq!(slab.block_size, block_size);
-                debug_assert_eq!(slab.capacity, capacity);
-                debug_assert_eq!(slab.state, SlabState::Loaned);
-                debug_assert_eq!(slab.central_free_len, 0);
-                debug_assert_eq!(slab.bucket_slot, None);
-                slab.last_touched_epoch = epoch;
-                self.recent_slab = Some(index);
+            Ok(slot) => {
+                let slab_id = self.slabs_by_start[slot];
+                self.slabs[slab_id].reset(start, block_size, capacity, epoch);
+                self.recent_slab = Some(slab_id);
             }
-            Err(index) => {
+            Err(slot) => {
+                let slab_id = self.slabs.len();
                 self.slabs
-                    .insert(index, SlabRecord::new(start, block_size, capacity, epoch));
-                self.shift_indices_for_insert(index);
-                self.recent_slab = Some(index);
+                    .push(SlabRecord::new(start, block_size, capacity, epoch));
+                self.slabs_by_start.insert(slot, slab_id);
+                self.recent_slab = Some(slab_id);
             }
         }
 
@@ -187,26 +265,27 @@ impl ClassPool {
 
         let epoch = self.bump_epoch();
 
-        if let Some(index) = self.partial_slabs.last().copied() {
-            let batch = self.slabs[index].take_partial_batch(max);
-            let moved = batch.len();
-            if moved != 0 {
-                self.recent_slab = Some(index);
-                self.slabs[index].last_touched_epoch = epoch;
-                self.reconcile_bucket_state(index, SlabState::Partial);
-                self.maybe_sweep();
-                return CentralRefill::Batch(batch);
-            }
+        if let Some(slab_id) = self.partial_slabs.last().copied() {
+            let batch = self.slabs[slab_id].take_partial_batch(max);
+            debug_assert!(
+                !batch.is_empty(),
+                "partial slab bucket must contain slabs with central capacity"
+            );
+            self.recent_slab = Some(slab_id);
+            self.slabs[slab_id].last_touched_epoch = epoch;
+            self.reconcile_bucket_state(slab_id, SlabState::Partial);
+            self.maybe_sweep();
+            return CentralRefill::Batch(batch);
         }
 
-        if let Some(index) = self.full_hot_slabs.last().copied() {
-            let refill = self.loan_whole_slab(index, epoch);
+        if let Some(slab_id) = self.full_hot_slabs.last().copied() {
+            let refill = self.loan_whole_slab(slab_id, epoch);
             self.maybe_sweep();
             return refill;
         }
 
-        if let Some(index) = self.full_cold_slabs.last().copied() {
-            let refill = self.loan_whole_slab(index, epoch);
+        if let Some(slab_id) = self.full_cold_slabs.last().copied() {
+            let refill = self.loan_whole_slab(slab_id, epoch);
             self.maybe_sweep();
             return refill;
         }
@@ -216,7 +295,8 @@ impl ClassPool {
     }
 
     unsafe fn return_batch(&mut self, batch: Batch) {
-        if batch.is_empty() {
+        let blocks = batch.len();
+        if blocks == 0 {
             return;
         }
 
@@ -227,30 +307,30 @@ impl ClassPool {
             list.push_batch(batch);
         }
 
-        while let Some(block) = {
-            // SAFETY: `list` owns only detached nodes from the incoming batch.
-            unsafe { list.pop_block() }
-        } {
-            let slab_index = self.find_slab_index(block);
+        for _ in 0..blocks {
+            // SAFETY: `list` was initialized from a detached batch with exactly `blocks`
+            // nodes, so each iteration pops one valid block until the batch is exhausted.
+            let block = unsafe { list.pop_block().unwrap_unchecked() };
+            let slab_id = self.find_slab_id(block);
             debug_assert!(
-                slab_index.is_some(),
+                slab_id.is_some(),
                 "returned block {:#x} must belong to a registered central slab",
                 block.as_ptr().addr()
             );
-            let index = slab_index.unwrap_or_else(|| {
+            let slab_id = slab_id.unwrap_or_else(|| {
                 unreachable!(
                     "returned block {:#x} must belong to a registered central slab",
                     block.as_ptr().addr()
                 )
             });
-            self.recent_slab = Some(index);
-            self.slabs[index].last_touched_epoch = epoch;
-            let previous_state = self.slabs[index].state;
-            // SAFETY: `find_slab_index` proved that `block` lies within this slab's range.
+            self.recent_slab = Some(slab_id);
+            self.slabs[slab_id].last_touched_epoch = epoch;
+            let previous_state = self.slabs[slab_id].state;
+            // SAFETY: `find_slab_id` proved that `block` lies within this slab's range.
             unsafe {
-                self.slabs[index].record_returned_block(block);
+                self.slabs[slab_id].record_returned_block(block);
             }
-            self.reconcile_bucket_state(index, previous_state);
+            self.reconcile_bucket_state(slab_id, previous_state);
         }
 
         self.maybe_sweep();
@@ -268,9 +348,9 @@ impl ClassPool {
         self.epoch
     }
 
-    fn loan_whole_slab(&mut self, index: usize, epoch: u64) -> CentralRefill {
+    fn loan_whole_slab(&mut self, slab_id: SlabId, epoch: u64) -> CentralRefill {
         let (start, block_size, capacity, previous_state) = {
-            let slab = &mut self.slabs[index];
+            let slab = &mut self.slabs[slab_id];
             debug_assert!(matches!(
                 slab.state,
                 SlabState::FullHot | SlabState::FullCold
@@ -288,8 +368,8 @@ impl ClassPool {
                 previous_state,
             )
         };
-        self.recent_slab = Some(index);
-        self.reconcile_bucket_transition(index, previous_state, SlabState::Loaned);
+        self.recent_slab = Some(slab_id);
+        self.reconcile_bucket_transition(slab_id, previous_state, SlabState::Loaned);
 
         CentralRefill::Slab {
             start,
@@ -299,20 +379,25 @@ impl ClassPool {
         }
     }
 
-    fn find_slab_index(&mut self, block: NonNull<u8>) -> Option<usize> {
-        if let Some(index) = self
+    fn find_slab_id(&mut self, block: NonNull<u8>) -> Option<SlabId> {
+        if let Some(slab_id) = self
             .recent_slab
-            .filter(|&index| self.slabs[index].contains(block))
+            .filter(|&slab_id| self.slabs[slab_id].contains(block))
         {
-            return Some(index);
+            return Some(slab_id);
         }
 
         let addr = block.as_ptr().addr();
-        let index = self.slabs.partition_point(|slab| slab.start <= addr);
-        let index = index.checked_sub(1)?;
-        if self.slabs[index].contains(block) {
-            self.recent_slab = Some(index);
-            Some(index)
+        let index = self
+            .slabs_by_start
+            .partition_point(|&slab_id| self.slabs[slab_id].start <= addr);
+        if index == 0 {
+            return None;
+        }
+        let slab_id = self.slabs_by_start[index - 1];
+        if self.slabs[slab_id].contains(block) {
+            self.recent_slab = Some(slab_id);
+            Some(slab_id)
         } else {
             None
         }
@@ -328,16 +413,16 @@ impl ClassPool {
 
         for _ in 0..budget {
             let bucket_slot = self.sweep_cursor % total;
-            let index = self.full_hot_slabs[bucket_slot];
+            let slab_id = self.full_hot_slabs[bucket_slot];
             self.sweep_cursor = (bucket_slot + 1) % total;
 
-            if !self.slabs[index].is_sweep_candidate(self.epoch) {
+            if !self.slabs[slab_id].is_sweep_candidate(self.epoch) {
                 continue;
             }
 
             let Some((addr, len)) = page_aligned_inner_range(
-                self.slabs[index].start_ptr(),
-                self.slabs[index].span_len(),
+                self.slabs[slab_id].start_ptr(),
+                self.slabs[slab_id].span_len(),
             ) else {
                 continue;
             };
@@ -346,48 +431,22 @@ impl ClassPool {
             // still-mapped arena slab owned by this allocator instance.
             let advised = unsafe { advise_free(addr, len) };
             if matches!(advised, Ok(true)) {
-                let previous_state = self.slabs[index].state;
-                self.slabs[index].state = SlabState::FullCold;
-                self.reconcile_bucket_transition(index, previous_state, SlabState::FullCold);
+                let previous_state = self.slabs[slab_id].state;
+                self.slabs[slab_id].state = SlabState::FullCold;
+                self.reconcile_bucket_transition(slab_id, previous_state, SlabState::FullCold);
             }
             break;
         }
     }
 
-    fn shift_indices_for_insert(&mut self, inserted_index: usize) {
-        for slab_index in &mut self.partial_slabs {
-            if *slab_index >= inserted_index {
-                *slab_index += 1;
-            }
-        }
-        for slab_index in &mut self.full_hot_slabs {
-            if *slab_index >= inserted_index {
-                *slab_index += 1;
-            }
-        }
-        for slab_index in &mut self.full_cold_slabs {
-            if *slab_index >= inserted_index {
-                *slab_index += 1;
-            }
-        }
-        if let Some(recent) = self
-            .recent_slab
-            .as_mut()
-            .filter(|recent| **recent >= inserted_index)
-        {
-            *recent += 1;
-        }
-        self.normalize_sweep_cursor();
-    }
-
-    fn reconcile_bucket_state(&mut self, index: usize, previous_state: SlabState) {
-        let next_state = self.slabs[index].state;
-        self.reconcile_bucket_transition(index, previous_state, next_state);
+    fn reconcile_bucket_state(&mut self, slab_id: SlabId, previous_state: SlabState) {
+        let next_state = self.slabs[slab_id].state;
+        self.reconcile_bucket_transition(slab_id, previous_state, next_state);
     }
 
     fn reconcile_bucket_transition(
         &mut self,
-        index: usize,
+        slab_id: SlabId,
         previous_state: SlabState,
         next_state: SlabState,
     ) {
@@ -395,12 +454,12 @@ impl ClassPool {
             return;
         }
 
-        self.remove_from_bucket(index, previous_state);
-        self.add_to_bucket(index, next_state);
+        self.remove_from_bucket(slab_id, previous_state);
+        self.add_to_bucket(slab_id, next_state);
     }
 
-    fn remove_from_bucket(&mut self, index: usize, state: SlabState) {
-        let Some(slot) = self.slabs[index].bucket_slot.take() else {
+    fn remove_from_bucket(&mut self, slab_id: SlabId, state: SlabState) {
+        let Some(slot) = self.slabs[slab_id].bucket_slot.take() else {
             debug_assert_eq!(state, SlabState::Loaned);
             return;
         };
@@ -412,17 +471,17 @@ impl ClassPool {
             SlabState::FullCold => &mut self.full_cold_slabs,
         };
         let removed = bucket.swap_remove(slot);
-        debug_assert_eq!(removed, index);
-        if let Some(&moved_index) = bucket.get(slot) {
-            self.slabs[moved_index].bucket_slot = Some(slot);
+        debug_assert_eq!(removed, slab_id);
+        if let Some(&moved_slab_id) = bucket.get(slot) {
+            self.slabs[moved_slab_id].bucket_slot = Some(slot);
         }
         self.normalize_sweep_cursor();
     }
 
-    fn add_to_bucket(&mut self, index: usize, state: SlabState) {
+    fn add_to_bucket(&mut self, slab_id: SlabId, state: SlabState) {
         let bucket = match state {
             SlabState::Loaned => {
-                self.slabs[index].bucket_slot = None;
+                self.slabs[slab_id].bucket_slot = None;
                 return;
             }
             SlabState::Partial => &mut self.partial_slabs,
@@ -430,8 +489,8 @@ impl ClassPool {
             SlabState::FullCold => &mut self.full_cold_slabs,
         };
         let slot = bucket.len();
-        bucket.push(index);
-        self.slabs[index].bucket_slot = Some(slot);
+        bucket.push(slab_id);
+        self.slabs[slab_id].bucket_slot = Some(slot);
         self.normalize_sweep_cursor();
     }
 
@@ -445,17 +504,17 @@ impl ClassPool {
 
     #[cfg(test)]
     fn force_first_full_hot_to_cold_for_test(&mut self) -> bool {
-        let Some(&index) = self.full_hot_slabs.last() else {
+        let Some(&slab_id) = self.full_hot_slabs.last() else {
             return false;
         };
 
         let _guard = crate::arena::override_advise_free_for_test(Some(true));
         self.epoch = SWEEP_INTERVAL;
-        self.slabs[index].last_touched_epoch = SWEEP_INTERVAL - COLD_EPOCHS;
+        self.slabs[slab_id].last_touched_epoch = SWEEP_INTERVAL - COLD_EPOCHS;
         self.sweep_cursor = self.full_hot_slabs.len() - 1;
         self.maybe_sweep();
 
-        self.slabs[index].state == SlabState::FullCold
+        self.slabs[slab_id].state == SlabState::FullCold
     }
 }
 
@@ -480,6 +539,27 @@ impl SlabRecord {
             state: SlabState::Loaned,
             bucket_slot: None,
         }
+    }
+
+    fn reset(&mut self, start: NonNull<u8>, block_size: usize, capacity: usize, epoch: u64) {
+        let start_addr = start.as_ptr().addr();
+        let span_len = block_size
+            .checked_mul(capacity)
+            .unwrap_or_else(|| unreachable!("slab span length overflowed"));
+        let end_addr = start_addr
+            .checked_add(span_len)
+            .unwrap_or_else(|| unreachable!("slab end overflowed"));
+
+        debug_assert_eq!(self.start, start_addr);
+        debug_assert_eq!(self.block_size, block_size);
+        debug_assert_eq!(self.capacity, capacity);
+
+        self.end_addr = end_addr;
+        self.central_free_len = 0;
+        self.partial_free = FreeList::new();
+        self.last_touched_epoch = epoch;
+        self.state = SlabState::Loaned;
+        self.bucket_slot = None;
     }
 
     fn contains(&self, block: NonNull<u8>) -> bool {
@@ -671,6 +751,40 @@ mod tests {
         let batch = match refill {
             CentralRefill::Batch(batch) => batch,
             other => panic!("expected partial batch refill, got {other:?}"),
+        };
+        let returned = collect_batch(batch);
+
+        assert_eq!(returned.len(), 2);
+        assert_eq!(pool.block_counts()[SizeClass::B64.index()], 1);
+    }
+
+    #[test]
+    fn remote_returns_are_visible_in_block_counts_before_drain() {
+        let pool = CentralPool::new();
+        let slab = RegisteredSlab::new(&pool, SizeClass::B64, 4);
+
+        // SAFETY: the batch consists only of detached blocks from the registered slab.
+        unsafe {
+            pool.publish_remote_batch(SizeClass::B64, slab.batch(&[0, 1]));
+        }
+
+        assert_eq!(pool.block_counts()[SizeClass::B64.index()], 2);
+    }
+
+    #[test]
+    fn remote_returns_are_drained_before_partial_refill() {
+        let pool = CentralPool::new();
+        let slab = RegisteredSlab::new(&pool, SizeClass::B64, 4);
+
+        // SAFETY: the batch consists only of detached blocks from the registered slab.
+        unsafe {
+            pool.publish_remote_batch(SizeClass::B64, slab.batch(&[0, 1, 2]));
+        }
+
+        let refill = pool.take_refill(SizeClass::B64, 2);
+        let batch = match refill {
+            CentralRefill::Batch(batch) => batch,
+            other => panic!("expected inbox-drained partial batch refill, got {other:?}"),
         };
         let returned = collect_batch(batch);
 

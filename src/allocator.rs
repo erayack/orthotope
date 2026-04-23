@@ -5,6 +5,7 @@ use crate::arena::Arena;
 use crate::central_pool::{CentralPool, SlabFreshMode};
 use crate::config::AllocatorConfig;
 use crate::error::{AllocError, FreeError, InitError};
+use crate::free_list::Batch;
 use crate::header::{
     AllocationHeader, AllocationKind, HEADER_ALIGNMENT, HEADER_SIZE, block_start_from_user_ptr,
     clear_small_free_metadata, mark_small_block_freed, small_block_is_marked_freed,
@@ -252,7 +253,7 @@ impl Allocator {
                         remaining: self.arena.remaining(),
                     })?;
             }
-            BlockReuse::FreshNeedsOwnerRefresh => {
+            BlockReuse::NeedsOwnerAndRequestedSizeRefresh => {
                 let _ = AllocationHeader::refresh_small_requested_size_and_owner(
                     block_start,
                     requested_size,
@@ -422,11 +423,12 @@ impl Allocator {
                         }
                     }
                 } else {
-                    // SAFETY: this decoded block belongs to `class` and this allocator;
-                    // remote frees are detached into a dedicated remote buffer before
-                    // batched transfer into the central pool.
+                    // SAFETY: this decoded block belongs to `class` and this allocator.
+                    // Publishing it to the central remote-return inbox preserves detached
+                    // ownership until the matching class pool drains and resolves it.
                     unsafe {
-                        cache.push_remote_and_flush(class, block_start, &self.central);
+                        self.central
+                            .publish_remote_batch(class, Batch::from_single(block_start));
                     }
                 }
 

@@ -82,7 +82,7 @@ fn duplicate_free_after_hot_block_spills_into_slab_storage_is_detected() {
 }
 
 #[test]
-fn duplicate_remote_free_is_detected_after_flush_to_central() {
+fn duplicate_remote_free_is_detected_after_publish_to_central_inbox() {
     let allocator = Allocator::new(test_config())
         .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
     let mut source_cache = ThreadCache::new(*allocator.config());
@@ -92,7 +92,7 @@ fn duplicate_remote_free_is_detected_after_flush_to_central() {
         .unwrap_or_else(|error| panic!("expected allocation to succeed: {error}"));
 
     // SAFETY: `ptr` is live here. Using a different cache id forces the remote-free path,
-    // including the eager remote-buffer flush into central.
+    // including publication into the shared central inbox.
     let first = unsafe { allocator.deallocate_with_cache(&mut remote_cache, ptr) };
     assert_eq!(first, Ok(()));
 

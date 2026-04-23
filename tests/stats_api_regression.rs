@@ -1,5 +1,14 @@
 use orthotope::{Allocator, AllocatorConfig, SizeClass, ThreadCache};
 
+const fn align_up(value: usize, alignment: usize) -> usize {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        value
+    } else {
+        value + (alignment - remainder)
+    }
+}
+
 const fn draining_config() -> AllocatorConfig {
     AllocatorConfig {
         arena_size: 1 << 20,
@@ -70,6 +79,12 @@ fn large_reuse_stats_track_bucketed_free_blocks_correctly() {
     let second = allocator
         .allocate_with_cache(&mut cache, second_request)
         .unwrap_or_else(|error| panic!("expected second large allocation to succeed: {error}"));
+    let first_block_size = align_up(first_request + orthotope::header::HEADER_SIZE, 64);
+    let second_block_size = align_up(second_request + orthotope::header::HEADER_SIZE, 64);
+    let live = allocator.stats();
+
+    assert_eq!(live.large_live_allocations, 2);
+    assert_eq!(live.large_live_bytes, first_block_size + second_block_size);
 
     // SAFETY: both pointers are still live large allocations returned by this allocator.
     unsafe {
@@ -83,6 +98,7 @@ fn large_reuse_stats_track_bucketed_free_blocks_correctly() {
 
     let freed = allocator.stats();
     assert_eq!(freed.large_live_allocations, 0);
+    assert_eq!(freed.large_live_bytes, 0);
     assert_eq!(freed.large_free_blocks, 2);
     assert!(freed.large_free_bytes > 0);
 
@@ -92,6 +108,7 @@ fn large_reuse_stats_track_bucketed_free_blocks_correctly() {
 
     let after_reuse = allocator.stats();
     assert_eq!(after_reuse.large_live_allocations, 1);
+    assert_eq!(after_reuse.large_live_bytes, first_block_size);
     assert_eq!(after_reuse.large_free_blocks, 1);
     assert!(after_reuse.large_free_bytes < freed.large_free_bytes);
 
@@ -143,4 +160,32 @@ fn embedding_batch_sized_bursts_stay_local_with_default_medium_class() {
 
     assert!(local.local[class.index()].blocks >= 8);
     assert_eq!(shared.small_central[class.index()].blocks, 0);
+}
+
+#[test]
+fn remote_free_is_visible_in_shared_stats_before_refill_drains_the_inbox() {
+    let config = AllocatorConfig {
+        arena_size: 1 << 20,
+        alignment: 64,
+        refill_target_bytes: 256,
+        local_cache_target_bytes: 256,
+    };
+    let allocator = Allocator::new(config)
+        .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+    let mut source_cache = ThreadCache::new(config);
+    let mut remote_cache = ThreadCache::new(config);
+    let class = SizeClass::B64;
+    let ptr = allocator
+        .allocate_with_cache(&mut source_cache, 32)
+        .unwrap_or_else(|error| panic!("expected allocation to succeed: {error}"));
+
+    // SAFETY: `ptr` is live and freeing through another cache id exercises the remote path.
+    unsafe {
+        allocator
+            .deallocate_with_cache(&mut remote_cache, ptr)
+            .unwrap_or_else(|error| panic!("expected remote free to succeed: {error}"));
+    }
+
+    let shared = allocator.stats();
+    assert_eq!(shared.small_central[class.index()].blocks, 1);
 }

@@ -106,8 +106,10 @@ impl FreeList {
 
         debug_assert!(head.is_some(), "non-empty batch must have a head");
         debug_assert!(tail.is_some(), "non-empty batch must have a tail");
-        let head = head.unwrap_or_else(|| unreachable!("non-empty batch must have a head"));
-        let tail = tail.unwrap_or_else(|| unreachable!("non-empty batch must have a tail"));
+        // SAFETY: a non-empty batch is constructed only with both head and tail set.
+        let head = unsafe { head.unwrap_unchecked() };
+        // SAFETY: same invariant as for `head` above.
+        let tail = unsafe { tail.unwrap_unchecked() };
 
         // SAFETY: `tail` is the last node in the detached batch, so wiring it to this
         // list head splices the entire batch in front without disturbing batch order.
@@ -127,23 +129,19 @@ impl FreeList {
     /// this list.
     #[must_use]
     pub(crate) unsafe fn pop_batch(&mut self, max: usize) -> Batch {
-        if max == 0 || self.is_empty() {
+        if max == 0 || self.len == 0 {
             return Batch::empty();
         }
 
         let take = core::cmp::min(max, self.len);
         debug_assert!(self.head.is_some(), "non-empty list must have a head");
-        let head = self
-            .head
-            .unwrap_or_else(|| unreachable!("non-empty list must have a head"));
+        // SAFETY: `self.len != 0` implies `self.head.is_some()` by the list invariant.
+        let head = unsafe { self.head.unwrap_unchecked() };
         let mut tail = head;
 
         for _ in 1..take {
             // SAFETY: we only walk within the first `take` nodes of a valid list.
-            tail = unsafe {
-                read_small_free_list_next(tail)
-                    .unwrap_or_else(|| unreachable!("free list shorter than recorded length"))
-            };
+            tail = unsafe { read_small_free_list_next(tail).unwrap_unchecked() };
         }
 
         // SAFETY: `tail` is the last node to detach, so taking its next pointer splits
@@ -181,6 +179,27 @@ impl Batch {
     /// Returns the number of blocks in the batch.
     pub(crate) const fn len(&self) -> usize {
         self.len
+    }
+
+    #[must_use]
+    /// Creates a detached single-block batch.
+    ///
+    /// # Safety
+    ///
+    /// `block` must be a valid detached allocator block that is not currently linked
+    /// in any free list.
+    pub(crate) unsafe fn from_single(block: NonNull<u8>) -> Self {
+        // SAFETY: the caller guarantees `block` is detached, so terminating it with
+        // `None` forms a valid single-node detached chain.
+        unsafe {
+            write_small_free_list_next(block, None);
+        }
+
+        Self {
+            head: Some(block),
+            tail: Some(block),
+            len: 1,
+        }
     }
 
     #[must_use]

@@ -20,6 +20,8 @@ const EMBEDDING_BYTES: usize = 1_536 * size_of::<f32>();
 const LARGE_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 const SAME_THREAD_SIZES: [usize; 5] = [32, 64, 65, 4_096, 70_000];
 const MIXED_SIZES: [usize; 8] = [32, 64, 65, 128, 512, 4_096, 16_384, 70_000];
+const LONG_LIVED_HANDOFF_ITERATIONS: usize = 80_000;
+const LONG_LIVED_HANDOFF_4X_PAIRS: usize = 4;
 const WARMUP_SAMPLES: usize = 3;
 const MEASURE_SAMPLES: usize = 9;
 
@@ -97,6 +99,7 @@ enum WorkloadKind {
     MixedSizeChurn,
     LargePath,
     LongLivedHandoff,
+    LongLivedHandoff4x,
 }
 
 impl Display for BenchError {
@@ -271,9 +274,15 @@ fn workloads() -> Vec<Workload> {
     });
     workloads.push(Workload {
         name: "long_lived_handoff",
-        operations: 80_000,
+        operations: LONG_LIVED_HANDOFF_ITERATIONS,
         unit: TimeUnit::Microseconds,
         kind: WorkloadKind::LongLivedHandoff,
+    });
+    workloads.push(Workload {
+        name: "long_lived_handoff_4x",
+        operations: LONG_LIVED_HANDOFF_ITERATIONS,
+        unit: TimeUnit::Microseconds,
+        kind: WorkloadKind::LongLivedHandoff4x,
     });
 
     workloads
@@ -311,6 +320,7 @@ fn run_workload(kind: WorkloadKind, allocator: AllocatorKind) -> Result<Duration
         WorkloadKind::MixedSizeChurn => run_mixed_size_churn(allocator),
         WorkloadKind::LargePath => run_large_path(allocator),
         WorkloadKind::LongLivedHandoff => run_long_lived_handoff(allocator),
+        WorkloadKind::LongLivedHandoff4x => run_long_lived_handoff_4x(allocator),
     }
 }
 
@@ -409,120 +419,149 @@ fn run_large_path(allocator: AllocatorKind) -> Result<Duration, BenchError> {
 }
 
 fn run_long_lived_handoff(allocator: AllocatorKind) -> Result<Duration, BenchError> {
+    run_long_lived_handoff_with_pairs(allocator, 1, LONG_LIVED_HANDOFF_ITERATIONS)
+}
+
+fn run_long_lived_handoff_4x(allocator: AllocatorKind) -> Result<Duration, BenchError> {
+    run_long_lived_handoff_with_pairs(
+        allocator,
+        LONG_LIVED_HANDOFF_4X_PAIRS,
+        LONG_LIVED_HANDOFF_ITERATIONS / LONG_LIVED_HANDOFF_4X_PAIRS,
+    )
+}
+
+fn run_long_lived_handoff_with_pairs(
+    allocator: AllocatorKind,
+    pair_count: usize,
+    iterations_per_pair: usize,
+) -> Result<Duration, BenchError> {
     match allocator {
-        AllocatorKind::Orthotope => run_long_lived_handoff_orthotope(),
+        AllocatorKind::Orthotope => run_long_lived_handoff_orthotope(pair_count, iterations_per_pair),
         AllocatorKind::System | AllocatorKind::MiMalloc | AllocatorKind::Jemalloc => {
-            run_long_lived_handoff_raw(allocator)
+            run_long_lived_handoff_raw(allocator, pair_count, iterations_per_pair)
         }
     }
 }
 
-fn run_long_lived_handoff_raw(allocator: AllocatorKind) -> Result<Duration, BenchError> {
-    let (sender, receiver) = sync_channel::<usize>(0);
-    let barrier = Arc::new(Barrier::new(3));
+fn run_long_lived_handoff_raw(
+    allocator: AllocatorKind,
+    pair_count: usize,
+    iterations_per_pair: usize,
+) -> Result<Duration, BenchError> {
+    let barrier = Arc::new(Barrier::new(pair_count * 2 + 1));
+    let mut handles = Vec::with_capacity(pair_count * 2);
 
-    let producer_barrier = Arc::clone(&barrier);
-    let producer = thread::spawn(move || -> Result<(), BenchError> {
-        let mut backend = raw_backend(allocator);
-        producer_barrier.wait();
-        for _ in 0..80_000 {
-            let ptr = backend.allocate(256)?;
-            sender
-                .send(ptr.as_ptr() as usize)
-                .map_err(|error| BenchError::Thread(format!("send failed: {error}")))?;
-        }
-        Ok(())
-    });
+    for _ in 0..pair_count {
+        let (sender, receiver) = sync_channel::<usize>(0);
 
-    let consumer_barrier = Arc::clone(&barrier);
-    let consumer = thread::spawn(move || -> Result<(), BenchError> {
-        let mut backend = raw_backend(allocator);
-        consumer_barrier.wait();
-        for _ in 0..80_000 {
-            let address = receiver
-                .recv()
-                .map_err(|error| BenchError::Thread(format!("receive failed: {error}")))?;
-            let ptr = NonNull::new(address as *mut u8).ok_or_else(|| {
-                BenchError::Thread("received null pointer during handoff".to_string())
-            })?;
-            unsafe {
-                backend.deallocate(ptr, 256)?;
+        let producer_barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<(), BenchError> {
+            let mut backend = raw_backend(allocator);
+            producer_barrier.wait();
+            for _ in 0..iterations_per_pair {
+                let ptr = backend.allocate(256)?;
+                sender
+                    .send(ptr.as_ptr() as usize)
+                    .map_err(|error| BenchError::Thread(format!("send failed: {error}")))?;
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        }));
+
+        let consumer_barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<(), BenchError> {
+            let mut backend = raw_backend(allocator);
+            consumer_barrier.wait();
+            for _ in 0..iterations_per_pair {
+                let address = receiver
+                    .recv()
+                    .map_err(|error| BenchError::Thread(format!("receive failed: {error}")))?;
+                let ptr = NonNull::new(address as *mut u8).ok_or_else(|| {
+                    BenchError::Thread("received null pointer during handoff".to_string())
+                })?;
+                unsafe {
+                    backend.deallocate(ptr, 256)?;
+                }
+            }
+            Ok(())
+        }));
+    }
 
     barrier.wait();
     let start = Instant::now();
 
-    producer
-        .join()
-        .map_err(|_| BenchError::Thread("producer thread panicked".to_string()))??;
-    consumer
-        .join()
-        .map_err(|_| BenchError::Thread("consumer thread panicked".to_string()))??;
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| BenchError::Thread("handoff thread panicked".to_string()))??;
+    }
 
     Ok(start.elapsed())
 }
 
-fn run_long_lived_handoff_orthotope() -> Result<Duration, BenchError> {
+fn run_long_lived_handoff_orthotope(
+    pair_count: usize,
+    iterations_per_pair: usize,
+) -> Result<Duration, BenchError> {
     let allocator = Arc::new(
         Allocator::new(AllocatorConfig::default())
             .map_err(|error| BenchError::Alloc(format!("orthotope init failed: {error}")))?,
     );
-    let (sender, receiver) = sync_channel::<usize>(0);
-    let barrier = Arc::new(Barrier::new(3));
+    let barrier = Arc::new(Barrier::new(pair_count * 2 + 1));
+    let mut handles = Vec::with_capacity(pair_count * 2);
 
-    let producer_allocator = Arc::clone(&allocator);
-    let producer_barrier = Arc::clone(&barrier);
-    let producer = thread::spawn(move || -> Result<(), BenchError> {
-        let mut cache = ThreadCache::new(*producer_allocator.config());
-        producer_barrier.wait();
-        for _ in 0..80_000 {
-            let ptr = producer_allocator
-                .allocate_with_cache(&mut cache, 256)
-                .map_err(|error| {
-                    BenchError::Alloc(format!("orthotope allocation failed: {error}"))
-                })?;
-            sender
-                .send(ptr.as_ptr() as usize)
-                .map_err(|error| BenchError::Thread(format!("send failed: {error}")))?;
-        }
-        Ok(())
-    });
+    for _ in 0..pair_count {
+        let (sender, receiver) = sync_channel::<usize>(0);
 
-    let consumer_allocator = Arc::clone(&allocator);
-    let consumer_barrier = Arc::clone(&barrier);
-    let consumer = thread::spawn(move || -> Result<(), BenchError> {
-        let mut cache = ThreadCache::new(*consumer_allocator.config());
-        consumer_barrier.wait();
-        for _ in 0..80_000 {
-            let address = receiver
-                .recv()
-                .map_err(|error| BenchError::Thread(format!("receive failed: {error}")))?;
-            let ptr = NonNull::new(address as *mut u8).ok_or_else(|| {
-                BenchError::Thread("received null pointer during handoff".to_string())
-            })?;
-            unsafe {
-                consumer_allocator
-                    .deallocate_with_size_checked(&mut cache, ptr, 256)
+        let producer_allocator = Arc::clone(&allocator);
+        let producer_barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<(), BenchError> {
+            let mut cache = ThreadCache::new(*producer_allocator.config());
+            producer_barrier.wait();
+            for _ in 0..iterations_per_pair {
+                let ptr = producer_allocator
+                    .allocate_with_cache(&mut cache, 256)
                     .map_err(|error| {
-                        BenchError::Alloc(format!("orthotope deallocation failed: {error}"))
+                        BenchError::Alloc(format!("orthotope allocation failed: {error}"))
                     })?;
+                sender
+                    .send(ptr.as_ptr() as usize)
+                    .map_err(|error| BenchError::Thread(format!("send failed: {error}")))?;
             }
-        }
-        Ok(())
-    });
+            Ok(())
+        }));
+
+        let consumer_allocator = Arc::clone(&allocator);
+        let consumer_barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<(), BenchError> {
+            let mut cache = ThreadCache::new(*consumer_allocator.config());
+            consumer_barrier.wait();
+            for _ in 0..iterations_per_pair {
+                let address = receiver
+                    .recv()
+                    .map_err(|error| BenchError::Thread(format!("receive failed: {error}")))?;
+                let ptr = NonNull::new(address as *mut u8).ok_or_else(|| {
+                    BenchError::Thread("received null pointer during handoff".to_string())
+                })?;
+                unsafe {
+                    consumer_allocator
+                        .deallocate_with_size_checked(&mut cache, ptr, 256)
+                        .map_err(|error| {
+                            BenchError::Alloc(format!("orthotope deallocation failed: {error}"))
+                        })?;
+                }
+            }
+            Ok(())
+        }));
+    }
 
     barrier.wait();
     let start = Instant::now();
 
-    producer
-        .join()
-        .map_err(|_| BenchError::Thread("producer thread panicked".to_string()))??;
-    consumer
-        .join()
-        .map_err(|_| BenchError::Thread("consumer thread panicked".to_string()))??;
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| BenchError::Thread("handoff thread panicked".to_string()))??;
+    }
 
     Ok(start.elapsed())
 }
