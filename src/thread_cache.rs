@@ -3,9 +3,10 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use std::vec::Vec;
 
 use crate::allocator::Allocator;
-use crate::central_pool::{CentralPool, CentralRefill, SlabFreshMode};
+use crate::central_pool::{CentralPool, CentralRefill};
 use crate::config::AllocatorConfig;
 use crate::free_list::{Batch, FreeList};
+use crate::header::AllocationHeader;
 use crate::size_class::{NUM_CLASSES, SizeClass};
 use crate::stats::{SizeClassStats, ThreadCacheStats};
 
@@ -14,10 +15,11 @@ use crate::stats::{SizeClassStats, ThreadCacheStats};
 /// Use one `ThreadCache` per participating thread when calling [`Allocator`] methods
 /// directly. The process-global convenience API manages this internally.
 pub struct ThreadCache {
-    classes: [LocalClassCache; NUM_CLASSES],
     config: AllocatorConfig,
     owner: Option<usize>,
     cache_id: u32,
+    classes: [LocalClassCache; NUM_CLASSES],
+    remote_returns: [RemoteReturnCache; NUM_CLASSES],
 }
 
 type SlabId = usize;
@@ -40,6 +42,11 @@ struct LocalClassCache {
     total_len: usize,
 }
 
+struct RemoteReturnCache {
+    pending: FreeList,
+    pending_len: usize,
+}
+
 static NEXT_CACHE_ID: AtomicU32 = AtomicU32::new(1);
 
 struct LocalSlab {
@@ -49,7 +56,6 @@ struct LocalSlab {
     capacity: usize,
     next_fresh: usize,
     free: FreeList,
-    fresh_mode: SlabFreshMode,
     available_slot: Option<usize>,
 }
 
@@ -61,10 +67,11 @@ impl ThreadCache {
     #[must_use]
     pub fn new(config: AllocatorConfig) -> Self {
         Self {
-            classes: core::array::from_fn(|_| LocalClassCache::new()),
             config,
             owner: None,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+            classes: core::array::from_fn(|_| LocalClassCache::new()),
+            remote_returns: core::array::from_fn(|_| RemoteReturnCache::new()),
         }
     }
 
@@ -92,6 +99,7 @@ impl ThreadCache {
     #[must_use]
     fn is_empty(&self) -> bool {
         self.classes.iter().all(LocalClassCache::is_empty)
+            && self.remote_returns.iter().all(RemoteReturnCache::is_empty)
     }
 
     #[must_use]
@@ -128,6 +136,70 @@ impl ThreadCache {
         unsafe { self.classes[class.index()].push_block(block) };
     }
 
+    /// Stages one block freed by a non-owner cache for batched publication to the
+    /// central remote-return inbox.
+    ///
+    /// # Safety
+    ///
+    /// `block` must be a valid detached allocator block for `class`, large enough for
+    /// the intrusive free-list node and not linked in any other list.
+    pub(crate) unsafe fn push_remote_return(&mut self, class: SizeClass, block: NonNull<u8>) {
+        // SAFETY: the caller guarantees `block` is detached and valid for the remote
+        // return queue of this class, and `&mut self` provides exclusive cache access.
+        unsafe { self.remote_returns[class.index()].push_block(block) };
+    }
+
+    #[must_use]
+    pub(crate) const fn should_flush_remote_returns(&self, class: SizeClass) -> bool {
+        self.remote_returns[class.index()].len() >= self.config.drain_count(class)
+    }
+
+    /// Publishes pending remote frees for one class to the central pool.
+    ///
+    /// # Safety
+    ///
+    /// Every pending remote-return node for `class` must be a valid detached block for
+    /// the allocator's central pool and must not be linked in any other list.
+    pub(crate) unsafe fn flush_remote_returns_for_class(
+        &mut self,
+        class: SizeClass,
+        central: &CentralPool,
+    ) -> usize {
+        let remote_returns = &mut self.remote_returns[class.index()];
+        if remote_returns.is_empty() {
+            return 0;
+        }
+
+        // SAFETY: the non-empty check above proves there is at least one pending node,
+        // and this method's caller guarantees every pending node is detached and valid
+        // for the matching central class.
+        let batch = unsafe { remote_returns.take_all_unchecked() };
+        let moved = batch.len();
+
+        // SAFETY: the pending remote-return cache stores only detached valid blocks
+        // for this class.
+        unsafe {
+            central.publish_remote_batch(class, batch);
+        }
+        moved
+    }
+
+    /// Publishes all pending remote frees to the central pool.
+    ///
+    /// # Safety
+    ///
+    /// Every pending remote-return node must be a valid detached block for its class
+    /// and must not be linked in any other list.
+    pub(crate) unsafe fn flush_all_remote_returns(&mut self, central: &CentralPool) {
+        for class in SizeClass::ALL {
+            // SAFETY: the cache invariant for each per-class remote-return list is the
+            // same as this method's caller contract.
+            unsafe {
+                self.flush_remote_returns_for_class(class, central);
+            }
+        }
+    }
+
     #[must_use]
     pub(crate) const fn needs_refill(&self, class: SizeClass) -> bool {
         self.classes[class.index()].is_empty()
@@ -149,10 +221,8 @@ impl ThreadCache {
                 start,
                 block_size,
                 capacity,
-                fresh_mode,
             } => {
-                self.classes[class.index()]
-                    .push_owned_slab(start, block_size, capacity, fresh_mode);
+                self.classes[class.index()].push_owned_slab(start, block_size, capacity);
                 capacity
             }
         }
@@ -169,9 +239,8 @@ impl ThreadCache {
         start: NonNull<u8>,
         block_size: usize,
         capacity: usize,
-        fresh_mode: SlabFreshMode,
     ) {
-        self.classes[class.index()].push_owned_slab(start, block_size, capacity, fresh_mode);
+        self.classes[class.index()].push_owned_slab(start, block_size, capacity);
     }
 
     /// Drains one configured batch from the local cache back to the central pool.
@@ -183,20 +252,19 @@ impl ThreadCache {
     /// # Safety
     ///
     /// Every node currently linked in the local list for `class` must be a valid block
-    /// for that size class and must belong exclusively to this cache.
+    /// for that size class and must belong exclusively to this cache. The caller must
+    /// have already established that [`Self::should_drain`] is true for `class`.
     pub(crate) unsafe fn drain_excess_to_central(
         &mut self,
         class: SizeClass,
         central: &CentralPool,
     ) -> usize {
-        if !self.should_drain(class) {
-            return 0;
-        }
+        debug_assert!(self.should_drain(class));
 
         // SAFETY: the caller guarantees the local class cache holds only valid nodes for
         // this class, and `&mut self` ensures exclusive access during detachment.
         let batch =
-            unsafe { self.classes[class.index()].pop_batch(self.config.drain_count(class)) };
+            unsafe { self.classes[class.index()].pop_batch(self.config.drain_count(class), class) };
         let moved = batch.len();
 
         // SAFETY: the detached batch originated from this class list and remains valid
@@ -216,18 +284,25 @@ impl ThreadCache {
     /// enough for the free-list node and linked in at most one list.
     #[allow(dead_code)]
     pub(crate) unsafe fn drain_all_to_central(&mut self, central: &CentralPool) {
+        // SAFETY: pending remote-return lists contain detached blocks for the matching
+        // central class and are independent from the local reusable cache lists.
+        unsafe {
+            self.flush_all_remote_returns(central);
+        }
+
         for class in SizeClass::ALL {
             loop {
+                let len = self.classes[class.index()].len();
+                if len == 0 {
+                    break;
+                }
+
                 let batch = {
                     let class_cache = &mut self.classes[class.index()];
                     // SAFETY: `&mut self` guarantees exclusive access to the full class
                     // cache while detached batches are removed until it is empty.
-                    unsafe { class_cache.pop_batch(class_cache.len()) }
+                    unsafe { class_cache.pop_batch(len, class) }
                 };
-
-                if batch.is_empty() {
-                    break;
-                }
 
                 // SAFETY: each detached batch came from the matching local class cache.
                 unsafe {
@@ -258,6 +333,41 @@ impl ThreadCache {
 
     fn reset_for_rebind(&mut self) {
         self.classes = core::array::from_fn(|_| LocalClassCache::new());
+        self.remote_returns = core::array::from_fn(|_| RemoteReturnCache::new());
+    }
+}
+
+impl RemoteReturnCache {
+    const fn new() -> Self {
+        Self {
+            pending: FreeList::new(),
+            pending_len: 0,
+        }
+    }
+
+    const fn len(&self) -> usize {
+        self.pending_len
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.pending_len == 0
+    }
+
+    unsafe fn push_block(&mut self, block: NonNull<u8>) {
+        // SAFETY: the caller guarantees `block` is detached and valid for this class.
+        unsafe {
+            self.pending.push_block(block);
+        }
+        self.pending_len += 1;
+    }
+
+    unsafe fn take_all_unchecked(&mut self) -> Batch {
+        debug_assert!(self.pending_len != 0);
+
+        // SAFETY: `pending` exclusively owns exactly `pending_len` detached nodes.
+        let batch = unsafe { self.pending.pop_batch_unchecked(self.pending_len) };
+        self.pending_len = 0;
+        batch
     }
 }
 
@@ -287,13 +397,7 @@ impl LocalClassCache {
         self.total_len == 0
     }
 
-    fn push_owned_slab(
-        &mut self,
-        start: NonNull<u8>,
-        block_size: usize,
-        capacity: usize,
-        fresh_mode: SlabFreshMode,
-    ) {
+    fn push_owned_slab(&mut self, start: NonNull<u8>, block_size: usize, capacity: usize) {
         let start_addr = start.as_ptr().addr();
         let slab_id = match self
             .slabs_by_start
@@ -303,13 +407,12 @@ impl LocalClassCache {
             Ok(slot) => {
                 let slab_id = self.slabs_by_start[slot];
                 self.mark_slab_unavailable(slab_id);
-                self.slabs[slab_id].reset(start, block_size, capacity, fresh_mode);
+                self.slabs[slab_id].reset(start, block_size, capacity);
                 slab_id
             }
             Err(slot) => {
                 let slab_id = self.slabs.len();
-                self.slabs
-                    .push(LocalSlab::new(start, block_size, capacity, fresh_mode));
+                self.slabs.push(LocalSlab::new(start, block_size, capacity));
                 self.slabs_by_start.insert(slot, slab_id);
                 slab_id
             }
@@ -427,10 +530,12 @@ impl LocalClassCache {
         self.total_len += len;
     }
 
-    unsafe fn pop_batch(&mut self, max: usize) -> Batch {
-        if max == 0 {
-            return Batch::empty();
-        }
+    unsafe fn pop_batch(&mut self, max: usize, class: SizeClass) -> Batch {
+        debug_assert!(max != 0, "class-cache batch pop requires a non-zero max");
+        debug_assert!(
+            self.total_len != 0,
+            "class-cache batch pop requires a non-empty cache"
+        );
 
         if self.shared_len != 0 {
             // SAFETY: the shared list contains only valid detached nodes for this class.
@@ -452,7 +557,7 @@ impl LocalClassCache {
             // SAFETY: membership in `available_slabs` plus `max > 0` guarantees that
             // `slab.pop_batch(max)` returns a non-empty batch while this cache has
             // exclusive access to the slab.
-            let batch = unsafe { slab.pop_batch(max) };
+            let batch = unsafe { slab.pop_batch(max, class) };
             let len = batch.len();
             debug_assert!(len != 0, "available slab must yield a non-empty batch");
             self.total_len -= len;
@@ -468,9 +573,13 @@ impl LocalClassCache {
             unsafe { list.push_block(block) };
             self.total_len -= 1;
             // SAFETY: the temporary list contains exactly one detached valid block.
-            return unsafe { list.pop_batch(1) };
+            return unsafe { list.pop_batch_unchecked(1) };
         }
 
+        debug_assert_eq!(
+            self.total_len, 0,
+            "non-empty class cache must have a backing source"
+        );
         Batch::empty()
     }
 
@@ -510,12 +619,7 @@ impl LocalClassCache {
 }
 
 impl LocalSlab {
-    fn new(
-        start: NonNull<u8>,
-        block_size: usize,
-        capacity: usize,
-        fresh_mode: SlabFreshMode,
-    ) -> Self {
+    fn new(start: NonNull<u8>, block_size: usize, capacity: usize) -> Self {
         let slab_bytes = block_size
             .checked_mul(capacity)
             .unwrap_or_else(|| unreachable!("local slab size overflowed"));
@@ -532,24 +636,16 @@ impl LocalSlab {
             capacity,
             next_fresh: 0,
             free: FreeList::new(),
-            fresh_mode,
             available_slot: None,
         }
     }
 
-    fn reset(
-        &mut self,
-        start: NonNull<u8>,
-        block_size: usize,
-        capacity: usize,
-        fresh_mode: SlabFreshMode,
-    ) {
+    fn reset(&mut self, start: NonNull<u8>, block_size: usize, capacity: usize) {
         debug_assert_eq!(self.start, start);
         debug_assert_eq!(self.block_size, block_size);
         debug_assert_eq!(self.capacity, capacity);
         self.next_fresh = 0;
         self.free = FreeList::new();
-        self.fresh_mode = fresh_mode;
         self.available_slot = None;
     }
 
@@ -590,10 +686,7 @@ impl LocalSlab {
         let offset = self.next_fresh * self.block_size;
         self.next_fresh += 1;
         let block = self.start.as_ptr().wrapping_add(offset);
-        let reuse = match self.fresh_mode {
-            SlabFreshMode::Preinitialized => BlockReuse::NeedsOwnerAndRequestedSizeRefresh,
-            SlabFreshMode::MustRewrite => BlockReuse::NeedsHeaderRewrite,
-        };
+        let reuse = BlockReuse::NeedsHeaderRewrite;
         // SAFETY: the caller guarantees available capacity, so the computed block start
         // stays within this non-null slab.
         (unsafe { NonNull::new_unchecked(block) }, reuse)
@@ -610,7 +703,7 @@ impl LocalSlab {
     /// Reclaimed blocks are drained first, but the returned batch may be topped up
     /// with untouched fresh capacity so over-limit drains can still return the full
     /// configured count.
-    unsafe fn pop_batch(&mut self, max: usize) -> Batch {
+    unsafe fn pop_batch(&mut self, max: usize, class: SizeClass) -> Batch {
         debug_assert!(max != 0, "slab batch pop requires a non-zero max");
         debug_assert!(
             self.has_available_blocks(),
@@ -629,19 +722,31 @@ impl LocalSlab {
         let fresh = core::cmp::min(max - reclaimed, self.capacity - self.next_fresh);
         let fresh_start = self.next_fresh;
         self.next_fresh += fresh;
-        for index in fresh_start..fresh_start + fresh {
-            let offset = index * self.block_size;
-            let block = self.start.as_ptr().wrapping_add(offset);
-            // SAFETY: `index` stays within remaining slab capacity, so each computed
-            // block start lies within the slab and is non-null.
-            unsafe { list.push_block(NonNull::new_unchecked(block)) };
+        let mut block = self
+            .start
+            .as_ptr()
+            .wrapping_add(fresh_start * self.block_size);
+        for _ in 0..fresh {
+            // SAFETY: `block` starts at the first reserved fresh block and advances by
+            // exactly `block_size` for `fresh` iterations, where `fresh` is bounded by
+            // remaining slab capacity. Slab starts are non-null.
+            let block_start = unsafe { NonNull::new_unchecked(block) };
+            // SAFETY: fresh blocks that leave the local slab for the central pool need
+            // initialized small metadata so a later partial-batch refill can refresh only
+            // the hot owner/request fields.
+            unsafe {
+                AllocationHeader::initialize_small_to_block_unchecked(block_start, class);
+            }
+            // SAFETY: `block_start` is one of the fresh block starts proven above.
+            unsafe { list.push_block(block_start) };
+            block = block.wrapping_add(self.block_size);
         }
 
         let taken = reclaimed + fresh;
         debug_assert!(taken != 0, "available slab must yield a non-empty batch");
         // SAFETY: the temporary list owns exactly `taken` detached blocks, preserving the
         // previous LIFO batch order while avoiding per-iteration availability checks.
-        unsafe { list.pop_batch(taken) }
+        unsafe { list.pop_batch_unchecked(taken) }
     }
 }
 
@@ -676,7 +781,7 @@ impl ThreadCacheHandle {
 
 impl Drop for ThreadCacheHandle {
     fn drop(&mut self) {
-        self.owner.drain_thread_cache_on_exit(&mut self.cache);
+        self.owner.drain_thread_cache(&mut self.cache);
     }
 }
 
@@ -685,7 +790,6 @@ mod tests {
     use super::{BlockReuse, ThreadCache, ThreadCacheHandle};
     use crate::allocator::Allocator;
     use crate::arena::system_page_size;
-    use crate::central_pool::SlabFreshMode;
     use crate::config::AllocatorConfig;
     use crate::header::block_start_from_user_ptr;
     use crate::size_class::SizeClass;
@@ -782,7 +886,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("expected small free to succeed: {error}"));
             }
         }
-        allocator.drain_thread_cache_on_exit(&mut source);
+        allocator.drain_thread_cache(&mut source);
 
         assert!(destination.needs_refill(SizeClass::B64));
         let moved =
@@ -897,7 +1001,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("expected medium free to succeed: {error}"));
         }
 
-        allocator.drain_thread_cache_on_exit(&mut cache);
+        allocator.drain_thread_cache(&mut cache);
 
         assert!(cache.needs_refill(SizeClass::B64));
         assert!(cache.needs_refill(SizeClass::B256));
@@ -932,7 +1036,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("expected source free to succeed: {error}"));
             }
         }
-        allocator.drain_thread_cache_on_exit(&mut source);
+        allocator.drain_thread_cache(&mut source);
 
         let moved =
             allocator.refill_thread_cache_from_central_for_test(&mut destination, SizeClass::B64);
@@ -966,7 +1070,7 @@ mod tests {
                 .deallocate_with_cache(&mut source, first)
                 .unwrap_or_else(|error| panic!("expected first free to succeed: {error}"));
         }
-        allocator.drain_thread_cache_on_exit(&mut source);
+        allocator.drain_thread_cache(&mut source);
 
         let moved = allocator.refill_thread_cache_from_central_for_test(&mut destination, class);
         assert_eq!(moved, 1);
@@ -1008,7 +1112,47 @@ mod tests {
     }
 
     #[test]
-    fn whole_slab_reissue_reuses_local_slab_record_and_marks_it_must_rewrite() {
+    fn drain_flushes_below_threshold_remote_returns_to_central_pool() {
+        let config = AllocatorConfig {
+            arena_size: 1 << 20,
+            alignment: 64,
+            refill_target_bytes: 32 << 10,
+            local_cache_target_bytes: 64 << 10,
+        };
+        let allocator = Allocator::new(config)
+            .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
+        let mut source = ThreadCache::new(config);
+        let mut remote = ThreadCache::new(config);
+        let class = SizeClass::B64;
+        let pointers = allocate_small_blocks(&allocator, &mut source, 2);
+
+        for ptr in pointers {
+            // SAFETY: each pointer is live and freeing through a different cache id
+            // exercises the staged remote-return path.
+            unsafe {
+                allocator
+                    .deallocate_with_cache(&mut remote, ptr)
+                    .unwrap_or_else(|error| panic!("expected remote free to succeed: {error}"));
+            }
+        }
+
+        assert_eq!(
+            allocator.stats().small_central[class.index()].blocks,
+            0,
+            "below-threshold remote frees stay staged in the freeing cache"
+        );
+
+        allocator.drain_thread_cache(&mut remote);
+
+        assert_eq!(
+            allocator.stats().small_central[class.index()].blocks,
+            2,
+            "draining the freeing cache publishes staged remote frees"
+        );
+    }
+
+    #[test]
+    fn whole_slab_reissue_reuses_local_slab_record_and_rewrites_header() {
         let allocator = Allocator::new(test_config())
             .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}"));
         let mut cache = ThreadCache::new(test_config());
@@ -1023,17 +1167,13 @@ mod tests {
                     .unwrap_or_else(|error| panic!("expected local free to succeed: {error}"));
             }
         }
-        allocator.drain_thread_cache_on_exit(&mut cache);
+        allocator.drain_thread_cache(&mut cache);
 
         assert_eq!(cache.classes[class.index()].slabs.len(), 1);
 
         let moved = allocator.refill_thread_cache_from_central_for_test(&mut cache, class);
         assert_eq!(moved, 2);
         assert_eq!(cache.classes[class.index()].slabs.len(), 1);
-        assert_eq!(
-            cache.classes[class.index()].slabs[0].fresh_mode,
-            SlabFreshMode::MustRewrite
-        );
         assert!(matches!(
             cache.pop(class),
             Some((_, BlockReuse::NeedsHeaderRewrite))
@@ -1059,7 +1199,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("expected source free to succeed: {error}"));
             }
         }
-        allocator.drain_thread_cache_on_exit(&mut source);
+        allocator.drain_thread_cache(&mut source);
         assert!(allocator.force_first_full_hot_slab_to_cold_for_test(class));
 
         let reused = allocator

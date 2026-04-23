@@ -11,12 +11,6 @@ const SWEEP_INTERVAL: u64 = 64;
 const COLD_EPOCHS: u64 = 4;
 const SWEEP_SCAN_BUDGET: usize = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SlabFreshMode {
-    Preinitialized,
-    MustRewrite,
-}
-
 type SlabId = usize;
 
 pub(crate) enum CentralRefill {
@@ -26,7 +20,6 @@ pub(crate) enum CentralRefill {
         start: NonNull<u8>,
         block_size: usize,
         capacity: usize,
-        fresh_mode: SlabFreshMode,
     },
 }
 
@@ -39,13 +32,11 @@ impl fmt::Debug for CentralRefill {
                 start,
                 block_size,
                 capacity,
-                fresh_mode,
             } => f
                 .debug_struct("Slab")
                 .field("start", &start)
                 .field("block_size", block_size)
                 .field("capacity", capacity)
-                .field("fresh_mode", fresh_mode)
                 .finish(),
         }
     }
@@ -366,7 +357,6 @@ impl ClassPool {
             start,
             block_size,
             capacity,
-            fresh_mode: SlabFreshMode::MustRewrite,
         }
     }
 
@@ -802,12 +792,10 @@ mod tests {
                 start,
                 block_size,
                 capacity,
-                fresh_mode,
             } => {
                 assert_eq!(start, slab.start);
                 assert_eq!(block_size, slab.block_size);
                 assert_eq!(capacity, slab.capacity);
-                assert_eq!(fresh_mode, super::SlabFreshMode::MustRewrite);
             }
             other => panic!("expected whole-slab refill, got {other:?}"),
         }

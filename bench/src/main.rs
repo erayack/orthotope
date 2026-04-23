@@ -22,6 +22,8 @@ const SAME_THREAD_SIZES: [usize; 5] = [32, 64, 65, 4_096, 70_000];
 const MIXED_SIZES: [usize; 8] = [32, 64, 65, 128, 512, 4_096, 16_384, 70_000];
 const LONG_LIVED_HANDOFF_ITERATIONS: usize = 80_000;
 const LONG_LIVED_HANDOFF_4X_PAIRS: usize = 4;
+const CONCURRENT_LARGE_4X_THREADS: usize = 4;
+const CONCURRENT_LARGE_ITERATIONS: usize = 1_200;
 const WARMUP_SAMPLES: usize = 3;
 const MEASURE_SAMPLES: usize = 9;
 
@@ -98,6 +100,7 @@ enum WorkloadKind {
     EmbeddingBatch,
     MixedSizeChurn,
     LargePath,
+    ConcurrentLarge4x,
     LongLivedHandoff,
     LongLivedHandoff4x,
 }
@@ -273,6 +276,12 @@ fn workloads() -> Vec<Workload> {
         kind: WorkloadKind::LargePath,
     });
     workloads.push(Workload {
+        name: "concurrent_large_4x",
+        operations: CONCURRENT_LARGE_ITERATIONS,
+        unit: TimeUnit::Microseconds,
+        kind: WorkloadKind::ConcurrentLarge4x,
+    });
+    workloads.push(Workload {
         name: "long_lived_handoff",
         operations: LONG_LIVED_HANDOFF_ITERATIONS,
         unit: TimeUnit::Microseconds,
@@ -319,6 +328,7 @@ fn run_workload(kind: WorkloadKind, allocator: AllocatorKind) -> Result<Duration
         WorkloadKind::EmbeddingBatch => run_embedding_batch(allocator),
         WorkloadKind::MixedSizeChurn => run_mixed_size_churn(allocator),
         WorkloadKind::LargePath => run_large_path(allocator),
+        WorkloadKind::ConcurrentLarge4x => run_concurrent_large_4x(allocator),
         WorkloadKind::LongLivedHandoff => run_long_lived_handoff(allocator),
         WorkloadKind::LongLivedHandoff4x => run_long_lived_handoff_4x(allocator),
     }
@@ -418,6 +428,94 @@ fn run_large_path(allocator: AllocatorKind) -> Result<Duration, BenchError> {
     })
 }
 
+fn run_concurrent_large_4x(allocator: AllocatorKind) -> Result<Duration, BenchError> {
+    match allocator {
+        AllocatorKind::Orthotope => run_concurrent_large_orthotope(),
+        AllocatorKind::System | AllocatorKind::MiMalloc | AllocatorKind::Jemalloc => {
+            run_concurrent_large_raw(allocator)
+        }
+    }
+}
+
+fn run_concurrent_large_raw(allocator: AllocatorKind) -> Result<Duration, BenchError> {
+    let iterations_per_thread = CONCURRENT_LARGE_ITERATIONS / CONCURRENT_LARGE_4X_THREADS;
+    let barrier = Arc::new(Barrier::new(CONCURRENT_LARGE_4X_THREADS + 1));
+    let mut handles = Vec::with_capacity(CONCURRENT_LARGE_4X_THREADS);
+
+    for _ in 0..CONCURRENT_LARGE_4X_THREADS {
+        let worker_barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<(), BenchError> {
+            let mut backend = raw_backend(allocator);
+            worker_barrier.wait();
+            for _ in 0..iterations_per_thread {
+                let ptr = backend.allocate(LARGE_REQUEST_BYTES)?;
+                black_box(ptr);
+                unsafe {
+                    backend.deallocate(ptr, LARGE_REQUEST_BYTES)?;
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    barrier.wait();
+    let start = Instant::now();
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| BenchError::Thread("concurrent large thread panicked".to_string()))??;
+    }
+
+    Ok(start.elapsed())
+}
+
+fn run_concurrent_large_orthotope() -> Result<Duration, BenchError> {
+    let allocator = Arc::new(
+        Allocator::new(AllocatorConfig::default())
+            .map_err(|error| BenchError::Alloc(format!("orthotope init failed: {error}")))?,
+    );
+    let iterations_per_thread = CONCURRENT_LARGE_ITERATIONS / CONCURRENT_LARGE_4X_THREADS;
+    let barrier = Arc::new(Barrier::new(CONCURRENT_LARGE_4X_THREADS + 1));
+    let mut handles = Vec::with_capacity(CONCURRENT_LARGE_4X_THREADS);
+
+    for _ in 0..CONCURRENT_LARGE_4X_THREADS {
+        let worker_allocator = Arc::clone(&allocator);
+        let worker_barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || -> Result<(), BenchError> {
+            let mut cache = ThreadCache::new(*worker_allocator.config());
+            worker_barrier.wait();
+            for _ in 0..iterations_per_thread {
+                let ptr = worker_allocator
+                    .allocate_with_cache(&mut cache, LARGE_REQUEST_BYTES)
+                    .map_err(|error| {
+                        BenchError::Alloc(format!("orthotope large allocation failed: {error}"))
+                    })?;
+                black_box(ptr);
+                unsafe {
+                    worker_allocator
+                        .deallocate_with_size_checked(&mut cache, ptr, LARGE_REQUEST_BYTES)
+                        .map_err(|error| {
+                            BenchError::Alloc(format!("orthotope large free failed: {error}"))
+                        })?;
+                }
+            }
+            Ok(())
+        }));
+    }
+
+    barrier.wait();
+    let start = Instant::now();
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| BenchError::Thread("concurrent large thread panicked".to_string()))??;
+    }
+
+    Ok(start.elapsed())
+}
+
 fn run_long_lived_handoff(allocator: AllocatorKind) -> Result<Duration, BenchError> {
     run_long_lived_handoff_with_pairs(allocator, 1, LONG_LIVED_HANDOFF_ITERATIONS)
 }
@@ -475,9 +573,9 @@ fn run_long_lived_handoff_raw(
                 let address = receiver
                     .recv()
                     .map_err(|error| BenchError::Thread(format!("receive failed: {error}")))?;
-                let ptr = NonNull::new(address as *mut u8).ok_or_else(|| {
-                    BenchError::Thread("received null pointer during handoff".to_string())
-                })?;
+                // SAFETY: producer sends only addresses from successful `NonNull`
+                // allocations on the paired channel.
+                let ptr = unsafe { NonNull::new_unchecked(address as *mut u8) };
                 unsafe {
                     backend.deallocate(ptr, 256)?;
                 }
@@ -539,9 +637,9 @@ fn run_long_lived_handoff_orthotope(
                 let address = receiver
                     .recv()
                     .map_err(|error| BenchError::Thread(format!("receive failed: {error}")))?;
-                let ptr = NonNull::new(address as *mut u8).ok_or_else(|| {
-                    BenchError::Thread("received null pointer during handoff".to_string())
-                })?;
+                // SAFETY: producer sends only addresses from successful `NonNull`
+                // allocations on the paired channel.
+                let ptr = unsafe { NonNull::new_unchecked(address as *mut u8) };
                 unsafe {
                     consumer_allocator
                         .deallocate_with_size_checked(&mut cache, ptr, 256)

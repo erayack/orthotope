@@ -2,10 +2,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arena::Arena;
-use crate::central_pool::{CentralPool, SlabFreshMode};
+use crate::central_pool::CentralPool;
 use crate::config::AllocatorConfig;
 use crate::error::{AllocError, FreeError, InitError};
-use crate::free_list::Batch;
 use crate::header::{
     AllocationHeader, AllocationKind, HEADER_ALIGNMENT, HEADER_SIZE, block_start_from_user_ptr,
     clear_small_free_metadata, mark_small_block_freed, small_block_is_marked_freed,
@@ -71,9 +70,18 @@ impl Allocator {
         self.id
     }
 
-    pub(crate) fn drain_thread_cache_on_exit(&self, cache: &mut ThreadCache) {
-        // SAFETY: thread-local teardown has exclusive access to the cache being drained,
-        // and each cached block already belongs to the matching per-class local list.
+    /// Drains cached small blocks and staged remote frees from `cache` into the shared
+    /// central pool.
+    ///
+    /// Direct instance-oriented callers should call this before discarding a
+    /// [`ThreadCache`] that may contain freed blocks. The process-global API performs
+    /// this drain automatically during thread-local cache teardown.
+    pub fn drain_thread_cache(&self, cache: &mut ThreadCache) {
+        cache.bind_to_allocator(self);
+
+        // SAFETY: the caller provides exclusive access to the cache being drained, and
+        // each cached block already belongs to the matching per-class local or
+        // remote-return list for this allocator.
         unsafe {
             cache.drain_all_to_central(&self.central);
         }
@@ -301,17 +309,10 @@ impl Allocator {
         };
 
         let carved = span.size() / block_size;
-        initialize_small_span_headers(span.start(), block_size, carved, class);
         self.central
             .register_slab(class, span.start(), block_size, carved);
 
-        cache.push_owned_slab(
-            class,
-            span.start(),
-            block_size,
-            carved,
-            SlabFreshMode::Preinitialized,
-        );
+        cache.push_owned_slab(class, span.start(), block_size, carved);
 
         Ok(carved)
     }
@@ -428,11 +429,13 @@ impl Allocator {
                     }
                 } else {
                     // SAFETY: this decoded block belongs to `class` and this allocator.
-                    // Publishing it to the central remote-return inbox preserves detached
-                    // ownership until the matching class pool drains and resolves it.
+                    // Staging it in the freeing cache preserves detached ownership until
+                    // a batched publish to the central remote-return inbox.
                     unsafe {
-                        self.central
-                            .publish_remote_batch(class, Batch::from_single(block_start));
+                        cache.push_remote_return(class, block_start);
+                        if cache.should_flush_remote_returns(class) {
+                            cache.flush_remote_returns_for_class(class, &self.central);
+                        }
                     }
                 }
 
@@ -500,27 +503,6 @@ impl Allocator {
     }
 }
 
-fn initialize_small_span_headers(
-    span_start: NonNull<u8>,
-    block_size: usize,
-    blocks: usize,
-    class: SizeClass,
-) {
-    let mut block_start = span_start.as_ptr();
-    for _ in 0..blocks {
-        // SAFETY: `block_start` walks the contiguous block starts inside one reserved
-        // span, and Orthotope's built-in small size classes always fit the header's
-        // fixed-width encoding.
-        unsafe {
-            AllocationHeader::initialize_small_to_block_unchecked(
-                NonNull::new_unchecked(block_start),
-                class,
-            );
-        }
-        block_start = block_start.wrapping_add(block_size);
-    }
-}
-
 const fn align_up_checked(value: usize, alignment: usize) -> Option<usize> {
     let remainder = value % alignment;
     if remainder == 0 {
@@ -578,7 +560,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("expected small free to succeed: {error}"));
             }
         }
-        allocator.drain_thread_cache_on_exit(&mut source);
+        allocator.drain_thread_cache(&mut source);
 
         let stats = allocator.stats();
         let class_stats = stats.small_central[SizeClass::B64.index()];

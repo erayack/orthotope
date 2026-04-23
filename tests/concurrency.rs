@@ -93,6 +93,7 @@ fn cross_thread_free_makes_block_visible_to_allocating_thread() {
             Ok(()) => {}
             Err(error) => panic!("expected cross-thread free to succeed: {error}"),
         }
+        freeing_allocator.drain_thread_cache(&mut cache);
 
         match freed_tx.send(()) {
             Ok(()) => {}
@@ -184,6 +185,46 @@ fn single_remote_free_does_not_strand_the_only_block_until_remote_threshold_is_m
         reused.unwrap_or_else(|error| panic!("expected freed block to become reusable: {error}"));
 
     assert_eq!(reused_addr, original_addr);
+}
+
+#[test]
+fn explicit_instance_cache_drain_publishes_below_threshold_remote_free() {
+    let allocator = Arc::new(
+        Allocator::new(AllocatorConfig {
+            arena_size: 128,
+            alignment: 64,
+            refill_target_bytes: 512,
+            local_cache_target_bytes: 512,
+        })
+        .unwrap_or_else(|error| panic!("expected allocator to initialize: {error}")),
+    );
+    let mut source_cache = ThreadCache::new(*allocator.config());
+    let mut freeing_cache = ThreadCache::new(*allocator.config());
+    let ptr = allocator
+        .allocate_with_cache(&mut source_cache, 32)
+        .unwrap_or_else(|error| panic!("expected initial allocation to succeed: {error}"));
+
+    // SAFETY: `ptr` is live and freeing through a different cache id exercises the
+    // staged remote-free path.
+    unsafe {
+        allocator
+            .deallocate_with_cache(&mut freeing_cache, ptr)
+            .unwrap_or_else(|error| panic!("expected remote free to succeed: {error}"));
+    }
+
+    let before_drain = allocator.allocate_with_cache(&mut source_cache, 32);
+    assert!(
+        before_drain.is_err(),
+        "below-threshold remote free should remain staged until explicit drain"
+    );
+
+    allocator.drain_thread_cache(&mut freeing_cache);
+
+    let reused = allocator
+        .allocate_with_cache(&mut source_cache, 32)
+        .unwrap_or_else(|error| panic!("expected drained remote block to be reusable: {error}"));
+
+    assert_eq!(reused, ptr);
 }
 
 #[test]
