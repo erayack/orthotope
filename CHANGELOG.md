@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.0
+
+Architecture:
+
+- Track small-object slabs by stable IDs in the thread cache and central pool,
+  avoiding vector rebuilds on slab registration and refill.
+- Replace remote-free buffering with a per-class central inbox; cross-thread
+  frees publish cheaply and resolve slab ownership on the next drain/refill.
+- Maintain large-object `live_bytes` incrementally so stats snapshots no longer
+  rescan the live large-allocation registry.
+
+Performance:
+
+- Refresh only the requested size and owner cache ID when reissuing a central
+  partial batch.
+- Trim redundant `Option`/emptiness checks from free-list and slab refill/drain
+  loops, enforcing those invariants at registration and in debug assertions.
+- Initialize fresh small-block headers via an infallible
+  `initialize_small_to_block_unchecked` path, dropping the dead `OutOfMemory`
+  branch on every span refill, and walk block starts by pointer increment.
+
+Tooling:
+
+- Add a `long_lived_handoff_4x` benchmark (4 concurrent producer/consumer
+  pairs) and `ORTHOTOPE_BENCH_WORKLOAD` / `ORTHOTOPE_BENCH_ALLOCATOR` env-var
+  filters for running a single workload or allocator in isolation.
+
 ## 0.2.0
 
 - **Breaking**: `FreeError` now includes a `DoubleFree` variant. Downstream
