@@ -222,6 +222,39 @@ impl Batch {
         self.len
     }
 
+    /// Pops one block from a known non-empty detached batch.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `self.len != 0`. Every linked node must point to
+    /// writable storage large enough for the reserved small-block link word and
+    /// must belong exclusively to this batch.
+    #[must_use]
+    pub(crate) unsafe fn pop_block_unchecked(&mut self) -> NonNull<u8> {
+        debug_assert!(
+            self.len != 0,
+            "unchecked batch pop requires a non-empty batch"
+        );
+        // SAFETY: the caller guarantees the batch is non-empty, so the batch
+        // invariant guarantees `self.head.is_some()`.
+        let head = unsafe { self.head.unwrap_unchecked() };
+        // SAFETY: `head` is a node already linked in this detached batch.
+        let next = unsafe { read_small_free_list_next(head) };
+
+        self.len -= 1;
+        self.head = next;
+        if self.len == 0 {
+            self.tail = None;
+        }
+
+        // SAFETY: `head` has been detached from the batch, so clearing the next
+        // pointer maintains the invariant that detached nodes are single-block chains.
+        unsafe {
+            write_small_free_list_next(head, None);
+        }
+        head
+    }
+
     #[must_use]
     /// Creates a detached single-block batch.
     ///
@@ -377,6 +410,36 @@ mod tests {
             assert_eq!(list.pop_block(), Some(ptrs[0]));
             assert_eq!(list.pop_block(), None);
         }
+    }
+
+    #[test]
+    fn batch_pop_unchecked_consumes_detached_chain() {
+        let mut list = FreeList::new();
+        let mut blocks = [TestBlock::new(), TestBlock::new(), TestBlock::new()];
+        initialize_test_header(&mut blocks[0], 8, 25);
+        initialize_test_header(&mut blocks[1], 16, 26);
+        initialize_test_header(&mut blocks[2], 24, 27);
+        let ptrs = blocks.each_mut().map(TestBlock::as_ptr);
+
+        // SAFETY: the test blocks are valid detached free-list nodes while owned by `list`.
+        unsafe {
+            list.push_block(ptrs[0]);
+            list.push_block(ptrs[1]);
+            list.push_block(ptrs[2]);
+        }
+
+        // SAFETY: the list contains exactly these three linked blocks.
+        let mut batch = unsafe { list.pop_batch_unchecked(3) };
+
+        assert_eq!(batch.len(), 3);
+        // SAFETY: each pop is guarded by the known remaining batch length.
+        unsafe {
+            assert_eq!(batch.pop_block_unchecked(), ptrs[2]);
+            assert_eq!(batch.pop_block_unchecked(), ptrs[1]);
+            assert_eq!(batch.pop_block_unchecked(), ptrs[0]);
+        }
+        assert_eq!(batch.len(), 0);
+        assert!(batch.is_empty());
     }
 
     #[test]

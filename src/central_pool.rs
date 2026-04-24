@@ -292,16 +292,12 @@ impl ClassPool {
         }
 
         let epoch = self.bump_epoch();
-        let mut list = FreeList::new();
-        // SAFETY: `batch` is detached and remains exclusively owned while we walk it.
-        unsafe {
-            list.push_batch(batch);
-        }
+        let mut batch = batch;
 
         for _ in 0..blocks {
-            // SAFETY: `list` was initialized from a detached batch with exactly `blocks`
-            // nodes, so each iteration pops one valid block until the batch is exhausted.
-            let block = unsafe { list.pop_block_unchecked() };
+            // SAFETY: `batch` starts with exactly `blocks` detached valid nodes, and
+            // each iteration removes one node until the batch is exhausted.
+            let block = unsafe { batch.pop_block_unchecked() };
             // SAFETY: `return_batch` accepts only detached blocks from slabs already
             // registered for this class, so lookup cannot fail for valid input.
             let slab_id = unsafe { self.find_slab_id_unchecked(block) };
