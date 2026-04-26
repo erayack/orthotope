@@ -191,7 +191,10 @@ impl Allocator {
 
         // SAFETY: the caller promises that `user_ptr` came from this allocator and is
         // valid to decode as an allocator block header.
-        unsafe { self.deallocate_impl(cache, user_ptr, None) }
+        let (header, kind) = unsafe { Self::decode_header(user_ptr)? };
+        // SAFETY: the decoded header passed boundary validation above, and the public
+        // deallocation contract guarantees the pointer names one live allocation.
+        unsafe { self.deallocate_decoded(cache, user_ptr, header, kind) }
     }
 
     /// Deallocates a pointer while validating the caller-provided allocation size.
@@ -220,7 +223,13 @@ impl Allocator {
 
         // SAFETY: the caller promises that `user_ptr` came from this allocator and is
         // valid to decode as an allocator block header.
-        unsafe { self.deallocate_impl(cache, user_ptr, Some(expected_size)) }
+        let (header, kind) = unsafe { Self::decode_header(user_ptr)? };
+        // SAFETY: the decoded header passed boundary validation above, and the checked
+        // path validates compatibility size at the point that preserves existing error
+        // precedence for invalid small duplicate frees.
+        unsafe {
+            self.deallocate_decoded_with_expected_size(cache, user_ptr, header, kind, expected_size)
+        }
     }
 
     fn allocate_small_with_cache(
@@ -301,12 +310,20 @@ impl Allocator {
     ) -> Result<usize, AllocError> {
         let block_size = class.block_size_for_alignment(self.config.alignment);
         let refill_count = self.config.refill_count(class);
-        let Some(span) = self.reserve_refill_span(block_size, refill_count, requested_size)? else {
-            return Err(AllocError::OutOfMemory {
+        let span = self
+            .arena
+            .reserve_block_span(block_size, refill_count)
+            .map_err(|error| match error {
+                AllocError::OutOfMemory { remaining, .. } => AllocError::OutOfMemory {
+                    requested: requested_size,
+                    remaining,
+                },
+                other => other,
+            })?
+            .ok_or_else(|| AllocError::OutOfMemory {
                 requested: requested_size,
                 remaining: self.arena.remaining(),
-            });
-        };
+            })?;
 
         let carved = span.size() / block_size;
         self.central
@@ -372,91 +389,132 @@ impl Allocator {
         Ok(user_ptr)
     }
 
-    unsafe fn deallocate_impl(
+    unsafe fn deallocate_decoded(
         &self,
         cache: &mut ThreadCache,
         user_ptr: NonNull<u8>,
-        expected_size: Option<usize>,
+        header: AllocationHeader,
+        kind: AllocationKind,
     ) -> Result<(), FreeError> {
-        // SAFETY: the caller guarantees `user_ptr` is intended to name an allocation
-        // from this allocator, so decoding its header is the required validation step.
-        let (header, kind) = unsafe { Self::decode_header(user_ptr)? };
-
         match kind {
             AllocationKind::Small(class) => {
-                let block_start = block_start_from_user_ptr(user_ptr);
-                // In v1, small-object ownership is proven only by a valid decoded
-                // header plus membership in this allocator's aligned arena range.
-                if !self.arena.contains_block_start(block_start) {
-                    return Err(FreeError::ForeignPointer);
-                }
-                // SAFETY: `block_start` passed header decoding and arena ownership checks, so
-                // the reserved freed marker is readable for duplicate-free detection.
-                if unsafe { small_block_is_marked_freed(block_start) } {
-                    return Err(FreeError::DoubleFree);
-                }
-                if let Some(expected_size) = expected_size {
-                    let recorded = header.requested_size();
-                    if expected_size != recorded {
-                        return Err(FreeError::SizeMismatch {
-                            provided: expected_size,
-                            recorded,
-                        });
-                    }
-                }
-                // SAFETY: the decoded block is still detached from allocator free-list state
-                // at this point, so marking it freed before routing preserves double-free
-                // detection across hot, slab, shared, remote, and central storage.
-                unsafe {
-                    mark_small_block_freed(block_start);
-                }
-                let owner_cache_id = header
-                    .small_owner_cache_id()
-                    .ok_or(FreeError::CorruptHeader)?;
-                if owner_cache_id == cache.cache_id() {
-                    // SAFETY: the decoded header proved that this user pointer belongs to a
-                    // valid small allocation block for `class`.
-                    unsafe {
-                        cache.push(class, block_start);
-                    }
-
-                    if cache.should_drain(class) {
-                        // SAFETY: the local cache for `class` contains only allocator-owned
-                        // blocks for that class, including the block just returned above.
-                        unsafe {
-                            cache.drain_excess_to_central(class, &self.central);
-                        }
-                    }
-                } else {
-                    // SAFETY: this decoded block belongs to `class` and this allocator.
-                    // Staging it in the freeing cache preserves detached ownership until
-                    // a batched publish to the central remote-return inbox.
-                    unsafe {
-                        cache.push_remote_return(class, block_start);
-                        if cache.should_flush_remote_returns(class) {
-                            cache.flush_remote_returns_for_class(class, &self.central);
-                        }
-                    }
-                }
-
+                let block_start = self.validate_small_block_for_free(user_ptr)?;
+                // SAFETY: the decoded header kind is `Small`, and the block passed the
+                // allocator ownership and duplicate-free boundary checks above.
+                unsafe { self.finish_small_free(cache, class, block_start, &header) };
                 Ok(())
             }
             AllocationKind::Large => {
-                if let Some(expected_size) = expected_size {
-                    let recorded = header.requested_size();
-                    if expected_size != recorded {
-                        return Err(FreeError::SizeMismatch {
-                            provided: expected_size,
-                            recorded,
-                        });
-                    }
-                }
-                self.large.validate_and_release_live_allocation(
-                    user_ptr,
-                    header.requested_size(),
-                    header.usable_size(),
-                )?;
+                self.release_large(user_ptr, &header)?;
                 Ok(())
+            }
+        }
+    }
+
+    unsafe fn deallocate_decoded_with_expected_size(
+        &self,
+        cache: &mut ThreadCache,
+        user_ptr: NonNull<u8>,
+        header: AllocationHeader,
+        kind: AllocationKind,
+        expected_size: usize,
+    ) -> Result<(), FreeError> {
+        match kind {
+            AllocationKind::Small(class) => {
+                let block_start = self.validate_small_block_for_free(user_ptr)?;
+                validate_expected_size(&header, expected_size)?;
+                // SAFETY: the decoded header kind is `Small`, the compatibility size
+                // matches, and the block passed ownership/duplicate-free checks above.
+                unsafe { self.finish_small_free(cache, class, block_start, &header) };
+                Ok(())
+            }
+            AllocationKind::Large => {
+                validate_expected_size(&header, expected_size)?;
+                self.release_large(user_ptr, &header)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_small_block_for_free(
+        &self,
+        user_ptr: NonNull<u8>,
+    ) -> Result<NonNull<u8>, FreeError> {
+        let block_start = block_start_from_user_ptr(user_ptr);
+        // In v1, small-object ownership is proven only by a valid decoded header plus
+        // membership in this allocator's aligned arena range.
+        if !self.arena.contains_block_start(block_start) {
+            return Err(FreeError::ForeignPointer);
+        }
+        // SAFETY: `block_start` passed header decoding and arena ownership checks, so
+        // the reserved freed marker is readable for duplicate-free detection.
+        if unsafe { small_block_is_marked_freed(block_start) } {
+            return Err(FreeError::DoubleFree);
+        }
+
+        Ok(block_start)
+    }
+
+    unsafe fn finish_small_free(
+        &self,
+        cache: &mut ThreadCache,
+        class: SizeClass,
+        block_start: NonNull<u8>,
+        header: &AllocationHeader,
+    ) {
+        // SAFETY: the decoded block is still detached from allocator free-list state at
+        // this point, so marking it freed before routing preserves double-free detection
+        // across hot, slab, shared, remote, and central storage.
+        unsafe {
+            mark_small_block_freed(block_start);
+        }
+        let owner_cache_id = header.small_owner_cache_id_after_kind_decode();
+        // SAFETY: the decoded block is marked freed, belongs to this allocator, and is
+        // ready to enter the appropriate cache/central return path.
+        unsafe { self.route_small_freed_block(cache, class, block_start, owner_cache_id) };
+    }
+
+    fn release_large(
+        &self,
+        user_ptr: NonNull<u8>,
+        header: &AllocationHeader,
+    ) -> Result<(), FreeError> {
+        self.large.validate_and_release_live_allocation(
+            user_ptr,
+            header.requested_size(),
+            header.usable_size(),
+        )
+    }
+
+    unsafe fn route_small_freed_block(
+        &self,
+        cache: &mut ThreadCache,
+        class: SizeClass,
+        block_start: NonNull<u8>,
+        owner_cache_id: u32,
+    ) {
+        if owner_cache_id == cache.cache_id() {
+            // SAFETY: the decoded header proved that this user pointer belongs to a
+            // valid small allocation block for `class`.
+            unsafe {
+                cache.push(class, block_start);
+            }
+
+            if cache.should_drain(class) {
+                // SAFETY: the local cache for `class` contains only allocator-owned
+                // blocks for that class, including the block just returned above.
+                unsafe {
+                    cache.drain_excess_to_central(class, &self.central);
+                }
+            }
+        } else {
+            // SAFETY: this decoded block belongs to `class` and this allocator. Staging
+            // it in the freeing cache preserves detached ownership until batch publish.
+            unsafe {
+                cache.push_remote_return(class, block_start);
+                if cache.should_flush_remote_returns(class) {
+                    cache.flush_remote_returns_for_class(class, &self.central);
+                }
             }
         }
     }
@@ -477,30 +535,21 @@ impl Allocator {
         // inspects only the routing fields before copying the full header.
         unsafe { AllocationHeader::read_from_user_ptr(user_ptr) }
     }
+}
 
-    fn reserve_refill_span(
-        &self,
-        block_size: usize,
-        refill_count: usize,
-        requested_size: usize,
-    ) -> Result<Option<crate::arena::ReservedSpan>, AllocError> {
-        let _ = block_size
-            .checked_mul(refill_count)
-            .ok_or_else(|| AllocError::OutOfMemory {
-                requested: requested_size,
-                remaining: self.arena.remaining(),
-            })?;
-
-        self.arena
-            .reserve_block_span(block_size, refill_count)
-            .map_err(|error| match error {
-                AllocError::OutOfMemory { remaining, .. } => AllocError::OutOfMemory {
-                    requested: requested_size,
-                    remaining,
-                },
-                other => other,
-            })
+const fn validate_expected_size(
+    header: &AllocationHeader,
+    expected_size: usize,
+) -> Result<(), FreeError> {
+    let recorded = header.requested_size();
+    if expected_size != recorded {
+        return Err(FreeError::SizeMismatch {
+            provided: expected_size,
+            recorded,
+        });
     }
+
+    Ok(())
 }
 
 const fn align_up_checked(value: usize, alignment: usize) -> Option<usize> {

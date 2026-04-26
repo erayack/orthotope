@@ -155,6 +155,14 @@ impl AllocationHeader {
         }
     }
 
+    #[must_use]
+    /// Returns the owner cache id after header decoding has already proven this is a
+    /// small-allocation header.
+    pub(crate) fn small_owner_cache_id_after_kind_decode(&self) -> u32 {
+        debug_assert_eq!(self.kind, AllocationKindTag::Small);
+        self.owner_cache_id
+    }
+
     #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     #[allow(dead_code)]
