@@ -16,6 +16,7 @@ use crate::stats::{SizeClassStats, ThreadCacheStats};
 /// directly. The process-global convenience API manages this internally.
 pub struct ThreadCache {
     config: AllocatorConfig,
+    class_config: [ClassCacheConfig; NUM_CLASSES],
     owner: Option<usize>,
     cache_id: u32,
     classes: [LocalClassCache; NUM_CLASSES],
@@ -42,12 +43,38 @@ struct LocalClassCache {
     total_len: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ClassCacheConfig {
+    refill_count: usize,
+    local_limit: usize,
+    drain_count: usize,
+}
+
 struct RemoteReturnCache {
     pending: FreeList,
     pending_len: usize,
 }
 
 static NEXT_CACHE_ID: AtomicU32 = AtomicU32::new(1);
+
+const fn class_config_table(config: AllocatorConfig) -> [ClassCacheConfig; NUM_CLASSES] {
+    let mut entries = [ClassCacheConfig {
+        refill_count: 0,
+        local_limit: 0,
+        drain_count: 0,
+    }; NUM_CLASSES];
+    let mut index = 0;
+    while index < NUM_CLASSES {
+        let class = SizeClass::ALL[index];
+        entries[index] = ClassCacheConfig {
+            refill_count: config.refill_count(class),
+            local_limit: config.local_limit(class),
+            drain_count: config.drain_count(class),
+        };
+        index += 1;
+    }
+    entries
+}
 
 struct LocalSlab {
     start: NonNull<u8>,
@@ -68,6 +95,7 @@ impl ThreadCache {
     pub fn new(config: AllocatorConfig) -> Self {
         Self {
             config,
+            class_config: class_config_table(config),
             owner: None,
             cache_id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
             classes: core::array::from_fn(|_| LocalClassCache::new()),
@@ -80,6 +108,7 @@ impl ThreadCache {
         self.cache_id
     }
 
+    #[inline]
     pub(crate) fn bind_to_allocator(&mut self, allocator: &Allocator) {
         let owner = allocator.id();
         if self.owner == Some(owner) {
@@ -93,6 +122,7 @@ impl ThreadCache {
 
         self.reset_for_rebind();
         self.config = *allocator.config();
+        self.class_config = class_config_table(self.config);
         self.owner = Some(owner);
     }
 
@@ -115,6 +145,7 @@ impl ThreadCache {
     ///
     /// The local cache for `class` must contain at least one available block.
     #[must_use]
+    #[inline]
     pub(crate) unsafe fn pop_available_unchecked(
         &mut self,
         class: SizeClass,
@@ -130,6 +161,7 @@ impl ThreadCache {
     ///
     /// `block` must be a valid detached allocator block for `class`, large enough for
     /// the intrusive free-list node and not linked in any other list.
+    #[inline]
     pub(crate) unsafe fn push(&mut self, class: SizeClass, block: NonNull<u8>) {
         // SAFETY: the caller guarantees `block` is a valid detached node for this class,
         // and `&mut self` provides exclusive access to the destination class cache.
@@ -150,8 +182,9 @@ impl ThreadCache {
     }
 
     #[must_use]
+    #[inline]
     pub(crate) const fn should_flush_remote_returns(&self, class: SizeClass) -> bool {
-        self.remote_returns[class.index()].len() >= self.config.drain_count(class)
+        self.remote_returns[class.index()].len() >= self.class_config[class.index()].drain_count
     }
 
     /// Publishes pending remote frees for one class to the central pool.
@@ -205,8 +238,9 @@ impl ThreadCache {
         self.classes[class.index()].is_empty()
     }
 
+    #[inline]
     pub(crate) fn refill_from_central(&mut self, class: SizeClass, central: &CentralPool) -> usize {
-        match central.take_refill(class, self.config.refill_count(class)) {
+        match central.take_refill(class, self.class_config[class.index()].refill_count) {
             CentralRefill::Empty => 0,
             CentralRefill::Batch(batch) => {
                 let moved = batch.len();
@@ -229,8 +263,9 @@ impl ThreadCache {
     }
 
     #[must_use]
+    #[inline]
     pub(crate) const fn should_drain(&self, class: SizeClass) -> bool {
-        self.classes[class.index()].len() > self.config.local_limit(class)
+        self.classes[class.index()].len() > self.class_config[class.index()].local_limit
     }
 
     pub(crate) fn push_owned_slab(
@@ -263,8 +298,10 @@ impl ThreadCache {
 
         // SAFETY: the caller guarantees the local class cache holds only valid nodes for
         // this class, and `&mut self` ensures exclusive access during detachment.
-        let batch =
-            unsafe { self.classes[class.index()].pop_batch(self.config.drain_count(class), class) };
+        let batch = unsafe {
+            self.classes[class.index()]
+                .pop_batch(self.class_config[class.index()].drain_count, class)
+        };
         let moved = batch.len();
 
         // SAFETY: the detached batch originated from this class list and remains valid
@@ -436,6 +473,7 @@ impl LocalClassCache {
         }
     }
 
+    #[inline]
     unsafe fn pop_block_unchecked(&mut self) -> (NonNull<u8>, BlockReuse) {
         debug_assert!(
             self.total_len != 0,
@@ -478,6 +516,7 @@ impl LocalClassCache {
         (block, BlockReuse::NeedsOwnerAndRequestedSizeRefresh)
     }
 
+    #[inline]
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
         if let Some(previous_hot) = self.hot_block.replace(block) {
             self.total_len += 1;
@@ -490,6 +529,7 @@ impl LocalClassCache {
         self.total_len += 1;
     }
 
+    #[inline]
     unsafe fn push_spilled_block(&mut self, block: NonNull<u8>) {
         if let Some(slab_id) = self
             .recent_slab
@@ -667,6 +707,7 @@ impl LocalSlab {
     /// # Safety
     ///
     /// The caller must ensure [`Self::has_available_blocks`] is true.
+    #[inline]
     unsafe fn pop_block_unchecked(&mut self) -> (NonNull<u8>, BlockReuse) {
         debug_assert!(
             self.has_available_blocks(),
@@ -692,6 +733,7 @@ impl LocalSlab {
         (unsafe { NonNull::new_unchecked(block) }, reuse)
     }
 
+    #[inline]
     unsafe fn push_block(&mut self, block: NonNull<u8>) {
         debug_assert!(self.contains(block));
         // SAFETY: the caller guarantees `block` is detached and valid for this slab.

@@ -592,9 +592,9 @@ pub(crate) unsafe fn write_small_free_list_next(
 
 pub(crate) unsafe fn clear_small_free_metadata(block_start: NonNull<u8>) {
     // SAFETY: the caller ensures this block has been detached from any free list before its
-    // free-list metadata is reset for live allocation use.
+    // freed marker is reset for live allocation use. The intrusive next-pointer word may
+    // remain stale while the block is live because only detached free-list operations read it.
     unsafe {
-        write_small_free_list_next(block_start, None);
         clear_small_block_freed(block_start);
     }
 }
