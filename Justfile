@@ -19,6 +19,12 @@ test-release:
 bench:
     cargo run --release --manifest-path bench/Cargo.toml
 
+flamegraph:
+    cargo flamegraph --manifest-path bench/Cargo.toml --profile flamegraph --bin flamegraph
+
+flamegraph-help:
+    cargo run --manifest-path bench/Cargo.toml --profile flamegraph --bin flamegraph -- --help
+
 qa: fmt fmt-check check clippy test
 
 qa-release: fmt fmt-check check clippy test test-release

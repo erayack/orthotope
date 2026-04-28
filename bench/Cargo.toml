@@ -3,8 +3,14 @@ name = "orthotope-bench"
 version = "0.1.0"
 edition = "2024"
 publish = false
+default-run = "orthotope-bench"
 
 [dependencies]
 jemallocator = "0.5.4"
 mimalloc = { version = "0.1.43", default-features = false }
 orthotope = { path = ".." }
+
+[profile.flamegraph]
+inherits = "release"
+debug = 2
+strip = "none"
