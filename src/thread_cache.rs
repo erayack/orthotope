@@ -161,11 +161,31 @@ impl ThreadCache {
     ///
     /// `block` must be a valid detached allocator block for `class`, large enough for
     /// the intrusive free-list node and not linked in any other list.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) unsafe fn push(&mut self, class: SizeClass, block: NonNull<u8>) {
         // SAFETY: the caller guarantees `block` is a valid detached node for this class,
         // and `&mut self` provides exclusive access to the destination class cache.
         unsafe { self.classes[class.index()].push_block(block) };
+    }
+
+    /// Pushes one local block and returns whether the class now exceeds its drain limit.
+    ///
+    /// # Safety
+    ///
+    /// `block` must be a valid detached allocator block for `class`, large enough for
+    /// the intrusive free-list node and not linked in any other list.
+    #[inline]
+    pub(crate) unsafe fn push_and_should_drain(
+        &mut self,
+        class: SizeClass,
+        block: NonNull<u8>,
+    ) -> bool {
+        let index = class.index();
+        // SAFETY: the caller guarantees `block` is a valid detached node for this class,
+        // and `&mut self` provides exclusive access to the destination class cache.
+        unsafe { self.classes[index].push_block(block) };
+        self.classes[index].len() > self.class_config[index].local_limit
     }
 
     /// Stages one block freed by a non-owner cache for batched publication to the
@@ -689,10 +709,12 @@ impl LocalSlab {
         self.available_slot = None;
     }
 
+    #[inline]
     const fn has_available_blocks(&self) -> bool {
         self.next_fresh < self.capacity || !self.free.is_empty()
     }
 
+    #[inline]
     fn contains(&self, block: NonNull<u8>) -> bool {
         let addr = block.as_ptr().addr();
         let start = self.start.as_ptr().addr();

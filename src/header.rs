@@ -443,15 +443,18 @@ impl AllocationHeader {
     pub(crate) unsafe fn read_from_user_ptr(
         user_ptr: NonNull<u8>,
     ) -> Result<(Self, AllocationKind), FreeError> {
-        let header_ptr = header_from_user_ptr(user_ptr);
         let header_prefix = header_prefix_from_user_ptr(user_ptr);
         // SAFETY: the caller already established that `user_ptr` has a plausible header
         // address and alignment; reading just the prefix is enough for routing validation.
         let prefix = unsafe { header_prefix.as_ptr().read() };
         let kind = validate_prefix(prefix)?;
-        // SAFETY: the same header address is valid for a full-header read once routing
-        // validation has confirmed a well-formed live header prefix.
-        let header = unsafe { header_ptr.as_ptr().read() };
+        let header = Self::from_encoded_fields(
+            prefix.kind,
+            prefix.class_index,
+            prefix.requested_size,
+            prefix.usable_size,
+            prefix.owner_cache_id,
+        );
         Ok((header, kind))
     }
 }
@@ -843,6 +846,41 @@ mod tests {
         assert_eq!(actual.requested_size(), 1024);
         assert_eq!(actual.usable_size(), SizeClass::B4K.payload_size());
         assert_eq!(actual.validate(), Ok(AllocationKind::Small(SizeClass::B4K)));
+    }
+
+    #[test]
+    fn read_from_user_ptr_ignores_stale_free_list_metadata() {
+        let mut storage = MaybeUninit::<TestBlock>::uninit();
+        let block_start = test_block_start(&mut storage);
+        let expected = small_header(SizeClass::B256, 144);
+        let header_ptr = expected.write_to_block(block_start);
+        let user_ptr = user_ptr_from_block_start(block_start);
+
+        // SAFETY: `header_ptr` points at the initialized test header, and these fields
+        // are reserved for detached free-list metadata rather than semantic routing data.
+        unsafe {
+            (*header_ptr.as_ptr()).free_list_link = block_start.as_ptr().addr().wrapping_add(64);
+            (*header_ptr.as_ptr()).small_free_marker = usize::MAX ^ 0x55aa_33cc;
+        }
+
+        // SAFETY: `user_ptr` names the live allocation represented by the initialized
+        // test header written above.
+        let (decoded, kind) = unsafe { AllocationHeader::read_from_user_ptr(user_ptr) }
+            .unwrap_or_else(|error| panic!("expected header decode to succeed: {error}"));
+
+        assert_eq!(kind, AllocationKind::Small(SizeClass::B256));
+        assert_eq!(
+            decoded.validate(),
+            Ok(AllocationKind::Small(SizeClass::B256))
+        );
+        assert_eq!(decoded.requested_size(), expected.requested_size());
+        assert_eq!(decoded.usable_size(), expected.usable_size());
+        assert_eq!(
+            decoded.small_owner_cache_id(),
+            expected.small_owner_cache_id()
+        );
+        assert_eq!(decoded.free_list_link, 0);
+        assert_eq!(decoded.small_free_marker, 0);
     }
 
     #[test]

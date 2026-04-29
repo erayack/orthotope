@@ -55,6 +55,7 @@ impl FreeList {
     ///
     /// `block` must be the start of a valid allocator block, properly aligned,
     /// and not currently linked in any free list.
+    #[inline]
     #[allow(clippy::missing_const_for_fn)]
     pub(crate) unsafe fn push_block(&mut self, block: NonNull<u8>) {
         // SAFETY: the caller guarantees that `block` points to writable storage large
@@ -93,6 +94,7 @@ impl FreeList {
     /// linked node must point to writable storage large enough for the reserved
     /// small-block link word and must belong exclusively to this list.
     #[must_use]
+    #[inline]
     pub(crate) unsafe fn pop_block_unchecked(&mut self) -> NonNull<u8> {
         debug_assert!(self.len != 0, "unchecked pop requires a non-empty list");
         // SAFETY: the caller guarantees the list is non-empty, so the list invariant
@@ -103,11 +105,6 @@ impl FreeList {
         let next = unsafe { read_small_free_list_next(head) };
         self.head = next;
         self.len -= 1;
-        // SAFETY: `head` has been detached from the list, so clearing the next pointer
-        // maintains the invariant that detached nodes are single-block chains.
-        unsafe {
-            write_small_free_list_next(head, None);
-        }
         head
     }
 
@@ -118,6 +115,7 @@ impl FreeList {
     /// `batch` must describe a valid detached chain whose nodes are not linked in any
     /// other free list and whose storage is large enough for the reserved small-block
     /// link word.
+    #[inline]
     #[allow(clippy::needless_pass_by_value)]
     pub(crate) unsafe fn push_batch(&mut self, batch: Batch) {
         let Batch { head, tail, len } = batch;
@@ -149,6 +147,7 @@ impl FreeList {
     /// enough for the reserved small-block link word and must belong exclusively to
     /// this list.
     #[must_use]
+    #[inline]
     pub(crate) unsafe fn pop_batch(&mut self, max: usize) -> Batch {
         if max == 0 || self.len == 0 {
             return Batch::empty();
@@ -167,6 +166,7 @@ impl FreeList {
     /// enough for the reserved small-block link word and must belong exclusively to
     /// this list.
     #[must_use]
+    #[inline]
     pub(crate) unsafe fn pop_batch_unchecked(&mut self, max: usize) -> Batch {
         debug_assert!(max != 0, "unchecked batch pop requires a non-zero max");
         debug_assert!(
@@ -230,6 +230,7 @@ impl Batch {
     /// writable storage large enough for the reserved small-block link word and
     /// must belong exclusively to this batch.
     #[must_use]
+    #[inline]
     pub(crate) unsafe fn pop_block_unchecked(&mut self) -> NonNull<u8> {
         debug_assert!(
             self.len != 0,
@@ -247,11 +248,6 @@ impl Batch {
             self.tail = None;
         }
 
-        // SAFETY: `head` has been detached from the batch, so clearing the next
-        // pointer maintains the invariant that detached nodes are single-block chains.
-        unsafe {
-            write_small_free_list_next(head, None);
-        }
         head
     }
 

@@ -496,11 +496,7 @@ impl Allocator {
         if owner_cache_id == cache.cache_id() {
             // SAFETY: the decoded header proved that this user pointer belongs to a
             // valid small allocation block for `class`.
-            unsafe {
-                cache.push(class, block_start);
-            }
-
-            if cache.should_drain(class) {
+            if unsafe { cache.push_and_should_drain(class, block_start) } {
                 // SAFETY: the local cache for `class` contains only allocator-owned
                 // blocks for that class, including the block just returned above.
                 unsafe {
