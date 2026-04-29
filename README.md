@@ -94,13 +94,12 @@ Small-request size classes: `1..=64`, `65..=256`, `257..=4096`, `4097..=6144`,
 Full results in [`BENCHMARK`](BENCHMARK.md). In the current local run,
 Orthotope was:
 
-- fastest on 8 of 10 workloads against system, mimalloc, and jemalloc
-- ~`2.1x` faster than `mimalloc` / `jemalloc` on `mixed_size_churn`
-- ~`8.8x` / `6.3x` faster than `mimalloc` / `jemalloc` on `large_path`
-- ~`49x` faster than `mimalloc` on `same_thread_small_churn/70000`
+- fastest on 9 of 11 workloads against system, mimalloc, and jemalloc
+- ~`3.2x` / `3.1x` faster than `mimalloc` / `jemalloc` on `mixed_size_churn`
+- ~`10.6x` / `7.2x` faster than `mimalloc` / `jemalloc` on `large_path`
+- ~`75x` faster than `mimalloc` on `same_thread_small_churn/70000`
 
-Run the [`bench/`](bench/) harness against Orthotope, system, mimalloc, and
-jemalloc:
+Run the [`bench/`](bench/) harness against Orthotope, system, mimalloc, and jemalloc:
 
 ```sh
 just bench

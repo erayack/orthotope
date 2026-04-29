@@ -1,18 +1,23 @@
 # Changelog
 
-## 0.3.0
-
-Architecture:
-
-- Track small-object slabs by stable IDs in the thread cache and central pool,
-  avoiding vector rebuilds on slab registration and refill.
-- Replace remote-free buffering with a per-class central inbox; cross-thread
-  frees publish cheaply and resolve slab ownership on the next drain/refill.
-- Maintain large-object `live_bytes` incrementally so stats snapshots no longer
-  rescan the live large-allocation registry.
+## 0.3.1
 
 Performance:
 
+- Inline hot `FreeList`/`Batch` operations and avoid clearing stale intrusive
+  next pointers on single-node pops; only linked nodes' next pointers are
+  semantically meaningful, and insertion overwrites stale values.
+- Combine the same-owner thread-cache free push with its drain-limit check to
+  avoid repeated class routing on the small-object free path.
+- Inline local-slab availability/containment checks used during slab reuse.
+- Decode frees from the validated header prefix without reloading the full
+  64-byte allocation header.
+- Cache per-size-class refill, drain, and local-limit counts in `ThreadCache`
+  instead of recomputing them from `AllocatorConfig` on hot allocate/free
+  paths.
+- Stop eagerly clearing the small-block intrusive next-pointer word on
+  reallocation; only the freed marker is reset because the next pointer is read
+  exclusively while blocks are detached in free lists.
 - Refresh only the requested size and owner cache ID when reissuing a central
   partial batch.
 - Trim redundant `Option`/emptiness checks from free-list and slab refill/drain
@@ -26,6 +31,17 @@ Tooling:
 - Add a `long_lived_handoff_4x` benchmark (4 concurrent producer/consumer
   pairs) and `ORTHOTOPE_BENCH_WORKLOAD` / `ORTHOTOPE_BENCH_ALLOCATOR` env-var
   filters for running a single workload or allocator in isolation.
+
+## 0.3.0
+
+Architecture:
+
+- Track small-object slabs by stable IDs in the thread cache and central pool,
+  avoiding vector rebuilds on slab registration and refill.
+- Replace remote-free buffering with a per-class central inbox; cross-thread
+  frees publish cheaply and resolve slab ownership on the next drain/refill.
+- Maintain large-object `live_bytes` incrementally so stats snapshots no longer
+  rescan the live large-allocation registry.
 
 ## 0.2.0
 
